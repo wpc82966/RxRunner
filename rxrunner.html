@@ -1,0 +1,2766 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-title" content="RxRunner"/>
+<meta name="theme-color" content="#1B2B5E"/>
+<title>RxRunner</title>
+<!-- Capture native URL.createObjectURL BEFORE xlsx.js overwrites it -->
+<script>window.__nativeCOBU = URL.createObjectURL.bind(URL);</script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-app.js"></script>
+<script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-database.js"></script>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#EEF2FF;overscroll-behavior:none;}
+input,select,button,textarea{font-family:inherit;}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(1.4)}}
+::-webkit-scrollbar{width:4px;}::-webkit-scrollbar-thumb{background:#CBD5E1;border-radius:4px;}
+@media print{body{background:white;}.no-print{display:none!important;}}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+// ══════════════════════════════════════════════════════
+// FIREBASE CONFIG — fill in your values for cross-device sync
+// Leave as-is to run fully offline (localStorage only)
+// ══════════════════════════════════════════════════════
+const FIREBASE_CONFIG = {
+  apiKey:"YOUR_API_KEY", authDomain:"YOUR_PROJECT.firebaseapp.com",
+  databaseURL:"https://YOUR_PROJECT-default-rtdb.firebaseio.com",
+  projectId:"YOUR_PROJECT", storageBucket:"YOUR_PROJECT.appspot.com",
+  messagingSenderId:"YOUR_SENDER_ID", appId:"YOUR_APP_ID"
+};
+let firebaseDB = null;
+const isFirebaseConfigured = () => FIREBASE_CONFIG.apiKey && FIREBASE_CONFIG.apiKey !== "YOUR_API_KEY";
+function initFirebase() {
+  if(isFirebaseConfigured()){
+    try{if(!firebase.apps.length)firebase.initializeApp(FIREBASE_CONFIG);firebaseDB=firebase.database();}
+    catch(e){firebaseDB=null;}
+  }
+}
+const LS={
+  get:(k)=>{try{const v=localStorage.getItem(k);return v?JSON.parse(v):null;}catch(e){return null;}},
+  set:(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v));}catch(e){}}
+};
+</script>
+<script type="text/babel">
+const {useState,useEffect,useRef,useCallback}=React;
+
+// ══════════════════════════════════════════════════════
+// CONSTANTS
+// ══════════════════════════════════════════════════════
+const HOURLY_RATE_DEFAULT=25.00, MILE_RATE=0.725;
+const MGR_PASSWORD="Pharmacy2026$";
+// Rates are config-driven; use these helpers after config is loaded
+function getHourlyRate(config){return parseFloat(config?.hourlyRate)||HOURLY_RATE_DEFAULT;}
+function getMileRate(config){return parseFloat(config?.mileRate)||MILE_RATE;}
+
+// ── White-Label Config ────────────────────────────────
+// Stored in localStorage under 'rxrunner:config'
+// orgName  = full company name shown above RxRunner in all headers
+// orgShort = short code used in CSV filenames (e.g. "CFRC")
+// billingEmail = where invoices are sent
+// setupDone = boolean, false means show onboarding on next launch
+const DEFAULT_CONFIG={orgName:'Your Organization',orgShort:'ORG',billingEmail:'billing@yourorg.com',setupDone:false};
+const loadConfig=()=>{const c=LS.get('rxrunner:config');return c?{...DEFAULT_CONFIG,...c}:DEFAULT_CONFIG;};
+const saveConfig=cfg=>LS.set('rxrunner:config',{...cfg,setupDone:true});
+const LOCS=["Orange City (Main)","Lake Mary","Kissimmee — CFRC","Kissimmee — Aziz","Winter Garden"];
+
+// Geocoded clinic coordinates — origin + all delivery stops
+const LOC_DATA={
+  "Orange City (Main)": {lat:28.9626953, lng:-81.2992605, addr:"1639 N Volusia Ave Ste B, Orange City, FL 32763"},
+  "Lake Mary":          {lat:28.7651310, lng:-81.3503401, addr:"795 Primera Blvd Suite 1001, Lake Mary, FL 32746"},
+  "Kissimmee — CFRC":  {lat:28.3009790, lng:-81.3962400, addr:"901 E Oak St Suite C, Kissimmee, FL 34744"},
+  "Kissimmee — Aziz":  {lat:28.3004306, lng:-81.4178702, addr:"1400 W Oak St STE B, Kissimmee, FL 34741"},
+  "Winter Garden":      {lat:28.5497636, lng:-81.6174229, addr:"15532 W Colonial Dr, Winter Garden, FL 34787"},
+};
+
+// Haversine distance in miles between two {lat,lng} points
+function haversineMi(a,b){
+  const R=3958.8, toR=d=>d*Math.PI/180;
+  const dLat=toR(b.lat-a.lat), dLng=toR(b.lng-a.lng);
+  const x=Math.sin(dLat/2)**2+Math.cos(toR(a.lat))*Math.cos(toR(b.lat))*Math.sin(dLng/2)**2;
+  return R*2*Math.atan2(Math.sqrt(x),Math.sqrt(1-x));
+}
+
+// Brute-force best order for ≤6 stops (max 720 permutations — instant)
+function optimizeRoute(originKey, stopKeys){
+  if(stopKeys.length===0)return{order:[],totalMi:0};
+  if(stopKeys.length===1){
+    const origin=LOC_DATA[originKey]||LOC_DATA["Orange City (Main)"];
+    const dest=LOC_DATA[stopKeys[0]];
+    const mi=origin&&dest?haversineMi(origin,dest):0;
+    return{order:stopKeys,totalMi:mi};
+  }
+  const permute=arr=>{if(arr.length<=1)return[arr];return arr.flatMap((v,i)=>permute([...arr.slice(0,i),...arr.slice(i+1)]).map(p=>[v,...p]));};
+  const perms=permute(stopKeys);
+  let best=null,bestDist=Infinity;
+  perms.forEach(perm=>{
+    let dist=0,prev=LOC_DATA[originKey]||LOC_DATA["Orange City (Main)"];
+    perm.forEach(k=>{if(LOC_DATA[k]){dist+=haversineMi(prev,LOC_DATA[k]);prev=LOC_DATA[k];}});
+    if(dist<bestDist){bestDist=dist;best=perm;}
+  });
+  return{order:best,totalMi:bestDist};
+}
+
+// Open optimized route in Google Maps (falls back gracefully on iOS to Apple Maps via redirect)
+function openInMaps(originKey, orderedStopKeys){
+  const origin=LOC_DATA[originKey]||LOC_DATA["Orange City (Main)"];
+  const stops=orderedStopKeys.map(k=>LOC_DATA[k]).filter(Boolean);
+  if(stops.length===0)return;
+  const dest=stops[stops.length-1];
+  const waypoints=stops.slice(0,-1);
+  const wStr=waypoints.map(s=>`${s.lat},${s.lng}`).join('|');
+  let url=`https://www.google.com/maps/dir/?api=1`
+    +`&origin=${origin.lat},${origin.lng}`
+    +`&destination=${dest.lat},${dest.lng}`
+    +`&travelmode=driving`;
+  if(wStr)url+=`&waypoints=${encodeURIComponent(wStr)}`;
+  window.open(url,'_blank');
+}
+
+const CHECKLIST=[
+  "Medications counted & verified against P.O. / Dispensing Record",
+  "NDC, lot number, and expiration date confirmed on each package",
+  "Cold packs & coolers confirmed at correct temp prior to loading",
+  "Temperature data logger activated and placed in cooler",
+  "Delivery Manifest printed and signed by dispensing staff",
+  "Contractor verified physical count against Manifest",
+  "Contractor verified cooler seal/integrity prior to departure",
+  "Return receipt process reviewed with Contractor"
+];
+const DRUG_MASTER=[
+  {ndc:"00003218713",name:"ORENCIA 250 MG VIAL",mfr:"Bristol-Myers Squibb",pkgs:1424},
+  {ndc:"50474071079",name:"CIMZIA 2X200 MG/ML SYRINGE KIT",mfr:"UCB",pkgs:900},
+  {ndc:"49401010101",name:"BENLYSTA 120 MG VIAL",mfr:"GlaxoSmithKline",pkgs:250},
+  {ndc:"57894035001",name:"SIMPONI ARIA 50 MG/4 ML VIAL",mfr:"Johnson & Johnson",pkgs:199},
+  {ndc:"00069080901",name:"INFLECTRA 100 MG VIAL",mfr:"Pfizer",pkgs:193},
+  {ndc:"78206016201",name:"RENFLEXIS 100 MG VIAL",mfr:"Organon",pkgs:181},
+  {ndc:"49401010201",name:"BENLYSTA 400 MG VIAL",mfr:"GlaxoSmithKline",pkgs:163},
+  {ndc:"57894003001",name:"REMICADE 100 MG VIAL",mfr:"Johnson & Johnson",pkgs:156},
+  {ndc:"00944270006",name:"GAMMAGARD LIQUID 10% 200ML VIAL",mfr:"Baxalta/Takeda",pkgs:130},
+  {ndc:"50242013501",name:"ACTEMRA 80 MG/4 ML VIAL",mfr:"Genentech/Roche",pkgs:126},
+  {ndc:"50242013701",name:"ACTEMRA 400 MG/20 ML VIAL",mfr:"Genentech/Roche",pkgs:116},
+  {ndc:"00069024901",name:"RUXIENCE 500 MG/50 ML VIAL",mfr:"Pfizer",pkgs:106},
+  {ndc:"55513099802",name:"EVENITY 210 MG DOSE-2 SYRINGES",mfr:"Amgen",pkgs:94},
+  {ndc:"00078116861",name:"COSENTYX 125 MG/5 ML VIAL",mfr:"Novartis",pkgs:86},
+  {ndc:"00310304000",name:"SAPHNELO 300 MG/2 ML VIAL",mfr:"AstraZeneca",pkgs:69},
+  {ndc:"61314024063",name:"JUBBONTI 60 MG/ML SYRINGE",mfr:"Sandoz",pkgs:67},
+  {ndc:"00069023801",name:"RUXIENCE 100 MG/10 ML VIAL",mfr:"Pfizer",pkgs:61},
+  {ndc:"55513071021",name:"PROLIA 60 MG/ML SYRINGE",mfr:"Amgen",pkgs:59},
+  {ndc:"50242013601",name:"ACTEMRA 200 MG/10 ML VIAL",mfr:"Genentech/Roche",pkgs:45},
+  {ndc:"65219059004",name:"TYENNE 80 MG/4 ML VIAL",mfr:"Fresenius Kabi",pkgs:43},
+  {ndc:"50242005306",name:"RITUXAN 500 MG/50 ML VIAL",mfr:"Genentech/Roche",pkgs:37},
+  {ndc:"00944270007",name:"GAMMAGARD LIQUID 10% 300ML VIAL",mfr:"Baxalta/Takeda",pkgs:26},
+  {ndc:"65219059210",name:"TYENNE 200 MG/10 ML VIAL",mfr:"Fresenius Kabi",pkgs:22},
+  {ndc:"63323018550",name:"WATER FOR INJECTION 50ML VIAL",mfr:"Fresenius Kabi USA",pkgs:12},
+  {ndc:"50242005121",name:"RITUXAN 100 MG/10 ML VIAL",mfr:"Genentech/Roche",pkgs:11},
+  {ndc:"63459010450",name:"TRUXIMA 500 MG/50 ML VIAL",mfr:"Teva",pkgs:10},
+  {ndc:"00386000102",name:"ETHYL CHLORIDE MIST SPRAY 116ML",mfr:"—",pkgs:10},
+  {ndc:"25021083082",name:"ZOLEDRONIC ACID 5 MG/100 ML",mfr:"Sagent Pharmaceuticals",pkgs:10},
+  {ndc:"00944270004",name:"GAMMAGARD LIQUID 10% 50ML VIAL",mfr:"Baxalta/Takeda",pkgs:9},
+  {ndc:"67457079410",name:"ZOLEDRONIC ACID 5 MG/100 ML",mfr:"Mylan Inc",pkgs:8},
+  {ndc:"00386000111",name:"ETHYL CHLORIDE MEDIUM STREAM",mfr:"—",pkgs:7},
+  {ndc:"00074501501",name:"SKYRIZI 600 MG/10 ML VIAL",mfr:"AbbVie",pkgs:6},
+  {ndc:"65219059420",name:"TYENNE 400 MG/20 ML VIAL",mfr:"Fresenius Kabi",pkgs:4},
+  {ndc:"00409488710",name:"WATER FOR INJECTION 10ML VIAL",mfr:"Hospira Inc",pkgs:4},
+  {ndc:"00264780020",name:"SODIUM CHLORIDE 0.9% 250ML",mfr:"B. Braun Medical",pkgs:4},
+  {ndc:"72266015201",name:"ZOLEDRONIC ACID 5 MG/100 ML",mfr:"Fosun Pharma USA",pkgs:3},
+  {ndc:"00009004722",name:"SOLU-MEDROL 125 MG VIAL",mfr:"Pfizer Inc",pkgs:3},
+  {ndc:"00009003928",name:"SOLU-MEDROL 40 MG VIAL",mfr:"Pfizer Inc",pkgs:3},
+  {ndc:"00054074287",name:"ALBUTEROL HFA 90 MCG INHALER",mfr:"Hikma Pharmaceuticals",pkgs:2},
+  {ndc:"49401008847",name:"BENLYSTA 200 MG/ML SYRINGE",mfr:"GlaxoSmithKline",pkgs:2},
+  {ndc:"00078073461",name:"ILARIS 150 MG/ML VIAL",mfr:"Novartis",pkgs:1},
+  {ndc:"50474070062",name:"CIMZIA 2X200 MG VIAL KIT",mfr:"UCB",pkgs:1},
+];
+
+// ══════════════════════════════════════════════════════
+// UTILS
+// ══════════════════════════════════════════════════════
+const haversine=(la1,lo1,la2,lo2)=>{const R=3958.8,r=d=>d*Math.PI/180,a=Math.sin(r(la2-la1)/2)**2+Math.cos(r(la1))*Math.cos(r(la2))*Math.sin(r(lo2-lo1)/2)**2;return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));};
+const fmtT=s=>[Math.floor(s/3600),Math.floor((s%3600)/60),s%60].map(v=>String(v).padStart(2,'0')).join(':');
+const fmtDT=ts=>ts?new Date(ts).toLocaleString('en-US',{month:'short',day:'numeric',year:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
+const fmtD=ts=>ts?new Date(ts).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}):'—';
+const cur=n=>`$${Number(n||0).toFixed(2)}`;
+const uid=()=>Date.now().toString(36)+Math.random().toString(36).slice(2,6);
+const fmtNDC=n=>n?`${n.slice(0,5)}-${n.slice(5,9)}-${n.slice(9)}`:'';
+const todayISO=()=>new Date().toISOString().slice(0,10);
+const isSecure=()=>window.isSecureContext||window.location.protocol==='https:'||window.location.hostname==='localhost';
+
+// ══════════════════════════════════════════════════════
+// PRINT / EXPORT FUNCTIONS  (all temps in °F)
+// ══════════════════════════════════════════════════════
+function printDeliveryLog(log,orgName=''){
+  const excursion=(log.form?.excursion||log.excursion)==='Yes';
+  const drugs=log.drugs||(log.drug?[log.drug]:[]);
+  const pickupSig=log.form?.pickupSig||log.pickupSig||null;
+  const deliverySig=log.form?.deliverySig||log.deliverySig||null;
+  const origin=log.origin||'Orange City (Main)';
+  const dest=log.dest||log.stop?.location||'—';
+  const depTemp=log.form?.depTemp||log.depTemp||'—';
+  const arrTemp=log.form?.arrTemp||log.arrTemp||'—';
+  const rcvdBy=log.form?.rcvdBy||log.rcvdBy||'—';
+  const lot=log.form?.lot||log.lot||'—';
+  const expDate=log.form?.expDate||log.expDate||'—';
+  const notes=log.form?.notes||log.notes||'';
+  const status=log.status||'complete';
+  const sigBlock=(label,src)=>src
+    ?`<div style="margin-top:12px"><div style="font-size:11px;font-weight:600;color:#555;margin-bottom:4px;">${label}</div><img src="${src}" style="border:1px solid #ccc;border-radius:4px;width:100%;max-width:320px;height:80px;object-fit:contain;background:#fafbff;"/></div>`
+    :`<div style="margin-top:12px"><div style="font-size:11px;font-weight:600;color:#555;margin-bottom:4px;">${label}</div><div style="border:1px solid #ccc;border-radius:4px;height:64px;background:#fafbff;display:flex;align-items:center;justify-content:center;color:#aaa;font-size:12px;">No signature captured</div></div>`;
+  const drugsHtml=(log.drugs||[]).length>0
+    ?log.drugs.map(d=>`<tr><td>${d.name||d.drugName||''}</td><td style="font-family:monospace;font-size:11px;">${fmtNDC(d.ndc||'')}</td><td>${d.qty||log.qty||'—'}</td><td>${d.lot||lot}</td></tr>`).join('')
+    :`<tr><td>${log.drugName||''}</td><td style="font-family:monospace;font-size:11px;">${fmtNDC(log.ndc||'')}</td><td>${log.qty||'—'}</td><td>${lot}</td></tr>`;
+  const statusBanner=status==='pending'?`<div style="background:#FFF7ED;border:2px solid #FED7AA;border-radius:6px;padding:12px;margin-bottom:12px;color:#C2410C;font-weight:700;font-size:13px;">⏳ PARTIAL LOG — Pickup complete. Delivery signature pending at ${dest}.</div>`:'';
+  const html=`<!DOCTYPE html><html><head><meta charset="UTF-8"/><title>RxRunner Cold Chain Log — ${fmtDT(log.pickupTimestamp||log.timestamp)}</title>
+  <style>body{font-family:Arial,sans-serif;margin:0;padding:20px;color:#1a1a1a;font-size:12px;}.header{background:#1B2B5E;color:white;padding:16px 20px;border-radius:6px;margin-bottom:16px;}.header h1{margin:0;font-size:18px;font-weight:900;}.header p{margin:4px 0 0;font-size:11px;opacity:0.75;}.section{border:1px solid #e2e8f0;border-radius:6px;padding:14px;margin-bottom:12px;}.section-title{font-size:11px;font-weight:700;color:#1B2B5E;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid #e2e8f0;}.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;}.field-label{font-size:10px;color:#94a3b8;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:2px;}.field-value{font-size:13px;font-weight:500;color:#1e293b;}table{width:100%;border-collapse:collapse;font-size:12px;}th{background:#f8fafc;font-weight:600;text-align:left;padding:7px 10px;border-bottom:1px solid #e2e8f0;font-size:11px;}td{padding:7px 10px;border-bottom:1px solid #f1f5f9;}.excursion{background:#fef2f2;border:2px solid #fca5a5;border-radius:6px;padding:12px;margin-bottom:12px;color:#991b1b;font-weight:700;font-size:13px;}.footer{margin-top:20px;padding-top:12px;border-top:1px solid #e2e8f0;font-size:10px;color:#94a3b8;display:flex;justify-content:space-between;}@media print{button{display:none;}}</style></head>
+  <body>
+  <button class="no-print" onclick="window.print()" style="margin-bottom:16px;padding:10px 20px;background:#1B2B5E;color:white;border:none;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;">🖨 Print This Report</button>
+  <button class="no-print" onclick="window.close()" style="margin-bottom:16px;margin-left:8px;padding:10px 20px;background:#f1f5f9;color:#475569;border:none;border-radius:6px;font-size:13px;cursor:pointer;">Close</button>
+  <div class="header"><h1>RxRunner — ${orgName||'Your Organization'}</h1><p>Cold Chain Transport Verification Report — Chain of Custody Record</p></div>
+  ${statusBanner}
+  ${excursion?'<div class="excursion">⚠ TEMPERATURE EXCURSION RECORDED — This delivery required prior authorization. Review required.</div>':''}
+  <div class="section"><div class="section-title">Delivery Record</div><div class="grid">
+    <div class="field"><div class="field-label">Log ID</div><div class="field-value" style="font-family:monospace;font-size:11px;">${log.id}</div></div>
+    <div class="field"><div class="field-label">Status</div><div class="field-value" style="color:${status==='complete'?'#059669':'#D97706'};font-weight:700;">${status==='complete'?'✓ Complete':'⏳ Pending Delivery Sig'}</div></div>
+    <div class="field"><div class="field-label">Origin</div><div class="field-value">${origin}</div></div>
+    <div class="field"><div class="field-label">Destination</div><div class="field-value">${dest}</div></div>
+    <div class="field"><div class="field-label">Pickup Time</div><div class="field-value">${fmtDT(log.pickupTimestamp||log.timestamp)}</div></div>
+    <div class="field"><div class="field-label">Delivery Time</div><div class="field-value">${log.completedTimestamp?fmtDT(log.completedTimestamp):'—'}</div></div>
+  </div></div>
+  <div class="section"><div class="section-title">Drug(s) Transported</div>
+    <table><thead><tr><th>Drug Name</th><th>NDC</th><th>Qty</th><th>Lot #</th></tr></thead><tbody>${drugsHtml}</tbody></table>
+  </div>
+  <div class="section"><div class="section-title">Temperature Record (°F)</div><div class="grid">
+    <div><div class="field-label">Departure Temp (°F)</div><div style="margin-top:4px;padding:8px 12px;border-radius:6px;background:${excursion?'#fef2f2':'#f0fdf4'};border:1px solid ${excursion?'#fca5a5':'#86efac'};color:${excursion?'#991b1b':'#065f46'};font-weight:700;font-size:16px;">${depTemp}°F</div></div>
+    <div><div class="field-label">Arrival Temp (°F)</div><div style="margin-top:4px;padding:8px 12px;border-radius:6px;background:${status==='pending'?'#f8fafc':excursion?'#fef2f2':'#f0fdf4'};border:1px solid ${status==='pending'?'#e2e8f0':excursion?'#fca5a5':'#86efac'};color:${status==='pending'?'#94a3b8':excursion?'#991b1b':'#065f46'};font-weight:700;font-size:16px;">${status==='pending'?'Pending':''+arrTemp+'°F'}</div></div>
+  </div>
+  <div style="margin-top:10px;padding:8px 12px;border-radius:6px;background:${excursion?'#fef2f2':'#f0fdf4'};border:1px solid ${excursion?'#fca5a5':'#86efac'};">
+    <span style="font-weight:700;color:${excursion?'#991b1b':'#065f46'};">${excursion?'⚠ EXCURSION DETECTED':'✓ No Temperature Excursion'}</span>
+    <span style="font-size:11px;color:#64748b;margin-left:12px;">Acceptable range: 36°F–46°F (refrigerated) or ≤77°F (room temp)</span>
+  </div>
+  ${notes?`<div style="margin-top:10px;"><div class="field-label">Notes</div><div style="margin-top:4px;color:#475569;">${notes}</div></div>`:''}
+  </div>
+  <div class="section"><div class="section-title">Chain of Custody Signatures</div><div class="grid">
+    ${sigBlock('Dispensing Staff Signature — '+origin,pickupSig)}
+    ${sigBlock('Receiver Signature — '+dest+' (Received By: '+rcvdBy+')',deliverySig)}
+  </div>
+  <div style="margin-top:12px;padding:8px 12px;background:#f8fafc;border-radius:6px;font-size:11px;color:#64748b;">Received By (printed name): <strong style="color:#1e293b;">${rcvdBy}</strong></div>
+  </div>
+  <div class="footer"><span>RxRunner Cold Chain Log · ${orgName||''} · Generated ${new Date().toLocaleString()}</span><span>CONFIDENTIAL — For internal use and regulatory compliance only</span></div></body></html>`;
+  const w=window.open('','_blank','width=800,height=700');w.document.write(html);w.document.close();
+}
+
+function printManifest(m,orgName=''){
+  const isCompiled=m.type==='compiled';
+  const checks=m.checks||{};
+  const checkedCount=Object.values(checks).filter(Boolean).length;
+  const sigBlock=(label,src)=>src
+    ?`<div><div style="font-size:10px;font-weight:700;color:#555;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px;">${label}</div><img src="${src}" style="border:1px solid #ddd;border-radius:4px;width:100%;max-width:300px;height:70px;object-fit:contain;background:#fafbff;"/></div>`
+    :`<div><div style="font-size:10px;font-weight:700;color:#555;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px;">${label}</div><div style="border:1px solid #ddd;border-radius:4px;height:56px;background:#fafbff;display:flex;align-items:center;justify-content:center;color:#bbb;font-size:11px;">Signature not captured</div></div>`;
+
+  // Build stops HTML for compiled manifests
+  const stopsHtml=isCompiled?(m.stops||[]).map((stop,si)=>{
+    const drugs=stop.drugs||[];
+    const excursion=stop.excursion==='Yes';
+    return`<div style="border:1px solid ${excursion?'#fca5a5':'#e2e8f0'};border-radius:8px;margin-bottom:14px;overflow:hidden;">
+      <div style="background:${excursion?'#fef2f2':'#f8fafc'};padding:10px 14px;display:flex;justify-content:space-between;align-items:center;">
+        <div style="font-weight:700;font-size:13px;color:#1e293b;">Stop ${si+1}: ${stop.dest||stop.location||''}</div>
+        ${excursion?'<div style="color:#dc2626;font-weight:700;font-size:11px;">⚠️ EXCURSION</div>':''}
+        <div style="font-size:11px;color:#64748b;">${drugs.length} drug${drugs.length!==1?'s':''}</div>
+      </div>
+      <div style="padding:10px 14px;">
+        <table style="width:100%;border-collapse:collapse;font-size:11px;">
+          <thead><tr style="background:#f1f5f9;">
+            <th style="text-align:left;padding:5px 8px;border-bottom:1px solid #e2e8f0;font-weight:700;color:#475569;">Drug Name</th>
+            <th style="text-align:left;padding:5px 8px;border-bottom:1px solid #e2e8f0;font-weight:700;color:#475569;">NDC</th>
+            <th style="text-align:center;padding:5px 8px;border-bottom:1px solid #e2e8f0;font-weight:700;color:#475569;">Qty</th>
+            <th style="text-align:left;padding:5px 8px;border-bottom:1px solid #e2e8f0;font-weight:700;color:#475569;">Lot #</th>
+            <th style="text-align:left;padding:5px 8px;border-bottom:1px solid #e2e8f0;font-weight:700;color:#475569;">Exp Date</th>
+          </tr></thead>
+          <tbody>${drugs.map(d=>`<tr>
+            <td style="padding:5px 8px;border-bottom:1px solid #f1f5f9;font-weight:500;">${d.name||''}</td>
+            <td style="padding:5px 8px;border-bottom:1px solid #f1f5f9;font-family:monospace;color:#64748b;">${fmtNDC(d.ndc||'')}</td>
+            <td style="padding:5px 8px;border-bottom:1px solid #f1f5f9;text-align:center;font-weight:700;">${d.qty||'—'}</td>
+            <td style="padding:5px 8px;border-bottom:1px solid #f1f5f9;color:#64748b;">${d.lot||'—'}</td>
+            <td style="padding:5px 8px;border-bottom:1px solid #f1f5f9;color:#64748b;">${d.expDate||'—'}</td>
+          </tr>`).join('')}</tbody>
+        </table>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px;">
+          <div style="font-size:11px;color:#64748b;"><span style="font-weight:600;">Dep Temp:</span> ${stop.depTemp?stop.depTemp+'°F':'—'}</div>
+          <div style="font-size:11px;color:#64748b;"><span style="font-weight:600;">Arr Temp:</span> ${stop.arrTemp?stop.arrTemp+'°F':'—'}</div>
+        </div>
+      </div>
+    </div>`;
+  }).join(''):'';
+
+  const totalDrugs=isCompiled?(m.stops||[]).reduce((a,s)=>a+(s.drugs||[]).length,0):0;
+
+  const html=`<!DOCTYPE html><html><head><meta charset="UTF-8"/>
+  <title>RxRunner Delivery Manifest — ${fmtD(m.timestamp||Date.now())}</title>
+  <style>
+    body{font-family:Arial,sans-serif;margin:0;padding:20px;font-size:12px;color:#1a1a1a;}
+    .header{background:#4C1D95;color:white;padding:16px 20px;border-radius:6px;margin-bottom:14px;}
+    .header h1{margin:0;font-size:18px;font-weight:900;letter-spacing:-0.02em;}
+    .header p{margin:4px 0 0;font-size:11px;opacity:0.75;}
+    .section{border:1px solid #e2e8f0;border-radius:6px;padding:14px;margin-bottom:12px;}
+    .section-title{font-size:10px;font-weight:700;color:#4C1D95;text-transform:uppercase;letter-spacing:0.07em;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid #e2e8f0;}
+    .meta-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:10px;}
+    .meta-item .lbl{font-size:10px;color:#94a3b8;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;}
+    .meta-item .val{font-size:13px;font-weight:600;color:#1e293b;margin-top:2px;}
+    .sig-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:10px;}
+    .item{display:flex;align-items:flex-start;gap:10px;padding:7px 8px;margin-bottom:5px;border-radius:5px;}
+    .check{width:16px;height:16px;border-radius:3px;border:2px solid #7C3AED;background:#7C3AED;display:flex;align-items:center;justify-content:center;flex-shrink:0;color:white;font-size:10px;font-weight:900;}
+    .footer{margin-top:18px;padding-top:10px;border-top:1px solid #e2e8f0;font-size:10px;color:#94a3b8;display:flex;justify-content:space-between;}
+    @media print{.no-print{display:none!important;}}
+  </style></head>
+  <body>
+  <div class="no-print" style="margin-bottom:14px;">
+    <button onclick="window.print()" style="padding:10px 20px;background:#4C1D95;color:white;border:none;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;margin-right:8px;">🖨 Print</button>
+    <button onclick="window.close()" style="padding:10px 20px;background:#f1f5f9;color:#475569;border:none;border-radius:6px;font-size:13px;cursor:pointer;">Close</button>
+  </div>
+  <div class="header">
+    <h1>RxRunner — ${orgName||'Your Organization'}</h1>
+    <p>${isCompiled?'Daily Delivery Manifest — Compiled from Cold Chain Logs':'Departure Verification Manifest — Chain of Custody'}</p>
+  </div>
+  <div class="section">
+    <div class="section-title">Run Summary</div>
+    <div class="meta-grid">
+      <div class="meta-item"><div class="lbl">Date</div><div class="val">${fmtD(m.timestamp||Date.now())}</div></div>
+      <div class="meta-item"><div class="lbl">Origin</div><div class="val">${m.origin||'Orange City (Main)'}</div></div>
+      ${isCompiled
+        ?`<div class="meta-item"><div class="lbl">Stops</div><div class="val">${(m.stops||[]).length}</div></div>
+           <div class="meta-item"><div class="lbl">Total Drugs</div><div class="val">${totalDrugs}</div></div>`
+        :`<div class="meta-item"><div class="lbl">Destination</div><div class="val">${m.dest||'—'}</div></div>`}
+      <div class="meta-item"><div class="lbl">Dispensing Staff</div><div class="val">${m.dispStaff||'—'}</div></div>
+      <div class="meta-item"><div class="lbl">Generated</div><div class="val">${new Date().toLocaleString()}</div></div>
+    </div>
+  </div>
+  ${isCompiled
+    ?`<div class="section"><div class="section-title">Delivery Stops (${(m.stops||[]).length})</div>${stopsHtml}</div>`
+    :`<div class="section"><div class="section-title">Departure Checklist (${checkedCount}/${CHECKLIST.length})</div>
+       ${CHECKLIST.map((item,i)=>`<div class="item" style="background:${checks[i]?'#F5F3FF':'#f8fafc'};"><div class="check">${checks[i]?'✓':''}</div><div style="font-size:12px;color:${checks[i]?'#5B21B6':'#475569'};">${item}</div></div>`).join('')}
+     </div>`}
+  <div class="section">
+    <div class="section-title">Signatures</div>
+    <div class="sig-grid">
+      ${sigBlock('Dispensing Staff Signature',m.dispSig)}
+      ${sigBlock('Driver / Contractor Signature',m.ctrSig)}
+    </div>
+  </div>
+  <div class="footer">
+    <span>RxRunner Delivery Manifest · ${orgName||''} · ${fmtD(m.timestamp||Date.now())} · Generated ${new Date().toLocaleString()}</span>
+    <span>CONFIDENTIAL — Chain of Custody Record</span>
+  </div>
+  </body></html>`;
+  const w=window.open('','_blank','width=900,height=750');w.document.write(html);w.document.close();
+}
+
+
+function exportLogsCSV(logs,orgShort='RxRunner'){
+  const header=['Log ID','Status','Timestamp','Type','Origin','Destination','Drug Name','NDC','Lot','Exp Date','Qty','Dep Temp (°F)','Arr Temp (°F)','Excursion','Received By','Notes'];
+  const rows=logs.map(l=>{
+    const drugName=l.drugs?.length>0?l.drugs.map(d=>d.name).join('; '):(l.drugName||l.drug?.name||'');
+    const ndc=l.drugs?.length>0?l.drugs.map(d=>fmtNDC(d.ndc)).join('; '):fmtNDC(l.ndc||l.drug?.ndc||'');
+    return[l.id,l.status||'complete',fmtDT(l.pickupTimestamp||l.timestamp),l.type||'adhoc',l.origin||'Orange City (Main)',l.dest||l.stop?.location||'',
+      drugName,ndc,l.form?.lot||l.lot||'',l.form?.expDate||l.expDate||'',l.qty||'',
+      l.form?.depTemp||l.depTemp||'',l.form?.arrTemp||l.arrTemp||'',
+      l.form?.excursion||l.excursion||'No',l.form?.rcvdBy||l.rcvdBy||'',l.form?.notes||l.notes||''
+    ].map(v=>`"${String(v).replace(/"/g,'""')}"`).join(',');
+  });
+  const csv=[header.join(','),...rows].join('\n');
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
+  a.download=`${orgShort}_ColdChainLogs_${new Date().toISOString().slice(0,10)}.csv`;a.click();
+}
+
+function exportManifestsCSV(manifests,orgShort='RxRunner'){
+  const header=['Manifest ID','Timestamp','Origin','Destination','Dispensing Staff','Checklist Items Verified'];
+  const rows=manifests.map(m=>[m.id,fmtDT(m.timestamp),m.origin,m.dest,m.dispStaff||'',`${Object.values(m.checks||{}).filter(Boolean).length}/${CHECKLIST.length}`]
+    .map(v=>`"${String(v).replace(/"/g,'""')}"`).join(','));
+  const csv=[header.join(','),...rows].join('\n');
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
+  a.download=`${orgShort}_Manifests_${new Date().toISOString().slice(0,10)}.csv`;a.click();
+}
+
+function exportSessionsCSV(sessions,orgShort='RxRunner',hourlyRate=HOURLY_RATE_DEFAULT){
+  const header=['Session ID','Date','Start Time','End Time','Duration (hrs)','Miles','Hourly Pay','Mileage Pay','Total Pay','Type','Paid'];
+  const rows=sessions.map(s=>{const hrs=s.totalSeconds/3600,hPay=hrs*hourlyRate,mPay=s.totalMiles*MILE_RATE;
+    return[s.id,s.date,fmtDT(s.startTime),fmtDT(s.endTime),hrs.toFixed(3),s.totalMiles.toFixed(3),hPay.toFixed(2),mPay.toFixed(2),(hPay+mPay).toFixed(2),s.manual?'Manual':'GPS',s.paid?'Yes':'No'].map(v=>`"${v}"`).join(',');});
+  const csv=[header.join(','),...rows].join('\n');
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
+  a.download=`${orgShort}_Sessions_${new Date().toISOString().slice(0,10)}.csv`;a.click();
+}
+
+function downloadXLSXTemplate(){
+  const wb=XLSX.utils.book_new();
+  // Template sheet
+  const instructions=[
+    ['CFRC Drug Delivery Run Template'],
+    ['Instructions: One row per drug. Rows with the same Delivery Date + Delivery Location are grouped into one stop.'],
+    [''],
+    ['Delivery Date','Delivery Location','Drug Name','NDC','Qty *REQUIRED*','Lot # (optional)','Exp Date (optional)']
+  ];
+  const exampleRows=[
+    [new Date().toISOString().slice(0,10),'Lake Mary','ORENCIA 250 MG VIAL','00003-2187-13','2','LT2024A','2026-12-31'],
+    [new Date().toISOString().slice(0,10),'Lake Mary','BENLYSTA 120 MG VIAL','49401-0101-01','1','LT2024B','2026-11-30'],
+    [new Date().toISOString().slice(0,10),'Kissimmee — CFRC','REMICADE 100 MG VIAL','57894-0030-01','3','LT2024C','2027-01-15'],
+  ];
+  const allRows=[...instructions,...exampleRows];
+  const ws=XLSX.utils.aoa_to_sheet(allRows);
+  ws['!cols']=[{wch:16},{wch:22},{wch:36},{wch:18},{wch:16},{wch:16},{wch:16}];
+  XLSX.utils.book_append_sheet(wb,ws,'Drug Run Template');
+  // Locations reference sheet
+  const locsSheet=XLSX.utils.aoa_to_sheet([['Valid Delivery Locations'],...LOCS.filter(l=>l!=='Orange City (Main)').map(l=>[l])]);
+  XLSX.utils.book_append_sheet(wb,locsSheet,'Valid Locations');
+  XLSX.write(wb,{bookType:'xlsx',type:'array'});
+  const data=XLSX.write(wb,{bookType:'xlsx',type:'array'});
+  const blob=new Blob([data],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='CFRC_Drug_Run_Template.xlsx';a.click();
+}
+
+// ══════════════════════════════════════════════════════
+// STYLES
+// ══════════════════════════════════════════════════════
+const S={
+  card:{background:'white',borderRadius:16,padding:16,boxShadow:'0 2px 8px rgba(0,0,0,0.07)',marginBottom:12},
+  lbl:{fontSize:11,fontWeight:700,color:'#94A3B8',textTransform:'uppercase',letterSpacing:'0.08em',marginBottom:10},
+  hdiv:{fontSize:13,fontWeight:700,color:'#1B2B5E',paddingBottom:8,marginBottom:12,borderBottom:'1px solid #E2E8F0'},
+  btnP:{width:'100%',padding:'16px',border:'none',borderRadius:12,color:'white',fontSize:15,fontWeight:700,cursor:'pointer',fontFamily:'inherit'},
+  btnSm:{flex:1,padding:'9px',border:'1px solid #CBD5E1',borderRadius:8,background:'white',color:'#64748B',fontSize:12,cursor:'pointer',fontFamily:'inherit'},
+  pill:(a)=>({padding:'6px 14px',borderRadius:20,border:'1px solid rgba(255,255,255,0.35)',background:a?'rgba(255,255,255,0.22)':'transparent',color:'white',fontSize:12,fontWeight:600,cursor:'pointer',fontFamily:'inherit'}),
+  input:{width:'100%',padding:'10px 12px',border:'1px solid #CBD5E1',borderRadius:8,fontSize:14,fontFamily:'inherit',boxSizing:'border-box',outline:'none'},
+  sel:{width:'100%',padding:'10px 12px',border:'1px solid #CBD5E1',borderRadius:8,fontSize:14,fontFamily:'inherit',background:'white',boxSizing:'border-box',outline:'none'},
+};
+
+// ══════════════════════════════════════════════════════
+// COMMON COMPONENTS
+// ══════════════════════════════════════════════════════
+const FR=({label,req,children})=>(
+  <div style={{marginBottom:10}}>
+    <div style={{fontSize:12,color:'#475569',fontWeight:500,marginBottom:4}}>{label}{req&&<span style={{color:'#EF4444',marginLeft:2}}>*</span>}</div>
+    {children}
+  </div>
+);
+const TIn=({value,onChange,placeholder,type='text'})=>(
+  <input type={type} value={value} onChange={e=>onChange(e.target.value)} placeholder={placeholder} style={S.input}/>
+);
+const Sel=({value,onChange,options,ph})=>(
+  <select value={value} onChange={e=>onChange(e.target.value)} style={S.sel}>
+    {ph&&<option value="">{ph}</option>}
+    {options.filter(Boolean).map(o=><option key={o} value={o}>{o}</option>)}
+  </select>
+);
+
+// ══════════════════════════════════════════════════════
+// SIGNATURE PAD
+// ══════════════════════════════════════════════════════
+function SigPad({label,onSave,resetKey=0}){
+  const ref=useRef(null),dn=useRef(false);
+  const[has,setHas]=useState(false),[saved,setSaved]=useState(false);
+  useEffect(()=>{if(ref.current)ref.current.getContext('2d').clearRect(0,0,600,160);setHas(false);setSaved(false);},[resetKey]);
+  const pt=(e,c)=>{const r=c.getBoundingClientRect(),sx=c.width/r.width,sy=c.height/r.height,t=e.touches?e.touches[0]:e;return[(t.clientX-r.left)*sx,(t.clientY-r.top)*sy];};
+  const down=e=>{e.preventDefault();dn.current=true;const c=ref.current,ctx=c.getContext('2d'),[x,y]=pt(e,c);ctx.beginPath();ctx.moveTo(x,y);};
+  const move=e=>{e.preventDefault();if(!dn.current)return;const c=ref.current,ctx=c.getContext('2d'),[x,y]=pt(e,c);ctx.lineWidth=2.5;ctx.lineCap='round';ctx.lineJoin='round';ctx.strokeStyle='#1B2B5E';ctx.lineTo(x,y);ctx.stroke();ctx.beginPath();ctx.moveTo(x,y);setHas(true);setSaved(false);};
+  const up=()=>{dn.current=false;};
+  const clear=()=>{ref.current.getContext('2d').clearRect(0,0,600,160);setHas(false);setSaved(false);};
+  const save=()=>{if(has&&onSave){onSave(ref.current.toDataURL('image/png'));setSaved(true);}};
+  return(
+    <div style={{marginTop:8}}>
+      {label&&<div style={{fontSize:12,fontWeight:600,color:'#475569',marginBottom:5}}>{label}</div>}
+      <div style={{border:`1.5px solid ${saved?'#86EFAC':'#CBD5E1'}`,borderRadius:10,background:'#FAFBFF',position:'relative',overflow:'hidden'}}>
+        <canvas ref={ref} width={600} height={160} style={{width:'100%',height:110,display:'block',touchAction:'none',cursor:'crosshair'}}
+          onMouseDown={down} onMouseMove={move} onMouseUp={up} onMouseLeave={up}
+          onTouchStart={down} onTouchMove={move} onTouchEnd={up}/>
+        {!has&&<div style={{position:'absolute',inset:0,display:'flex',alignItems:'center',justifyContent:'center',pointerEvents:'none'}}><span style={{color:'#94A3B8',fontSize:12,fontStyle:'italic'}}>Sign here with finger or mouse</span></div>}
+      </div>
+      <div style={{display:'flex',gap:8,marginTop:6}}>
+        <button onClick={clear} style={S.btnSm}>Clear</button>
+        <button onClick={save} disabled={!has} style={{...S.btnSm,flex:2,background:has?(saved?'#059669':'#1B2B5E'):'#E2E8F0',color:has?'white':'#94A3B8',border:'none',fontWeight:600}}>
+          {saved?'✓ Signature Saved':has?'Save Signature':'Draw to Sign'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════
+// DRUG SEARCH — shows ALL 42 drugs, no slice limit
+// ══════════════════════════════════════════════════════
+function DrugSearch({value,ndc,onChange,onClear}){
+  const[query,setQuery]=useState(value||'');
+  const[open,setOpen]=useState(false);
+  const ref=useRef(null);
+  useEffect(()=>{setQuery(value||'');},[value]);
+  // Show ALL drugs when empty, ALL matches when typing (no slice limit)
+  const filtered=query.trim().length===0
+    ?DRUG_MASTER
+    :DRUG_MASTER.filter(d=>
+        d.name.toLowerCase().includes(query.toLowerCase())||
+        d.ndc.includes(query.replace(/-/g,''))||
+        d.mfr.toLowerCase().includes(query.toLowerCase())
+      );
+  const select=d=>{onChange(d);setQuery(d.name);setOpen(false);};
+  const clear=()=>{setQuery('');onChange(null);onClear&&onClear();};
+  const hl=(text,q)=>{if(!q.trim())return text;const i=text.toLowerCase().indexOf(q.toLowerCase());if(i===-1)return text;return<>{text.slice(0,i)}<mark style={{background:'#FEF08A',borderRadius:2,padding:'0 1px'}}>{text.slice(i,i+q.length)}</mark>{text.slice(i+q.length)}</>;};
+  useEffect(()=>{const h=e=>{if(ref.current&&!ref.current.contains(e.target))setOpen(false);};document.addEventListener('mousedown',h);return()=>document.removeEventListener('mousedown',h);},[]);
+  return(
+    <div ref={ref} style={{position:'relative'}}>
+      <div style={{position:'relative'}}>
+        <input value={query} onChange={e=>{setQuery(e.target.value);onChange(null);setOpen(true);}} onFocus={()=>setOpen(true)}
+          placeholder="Search all 42 drugs — name, NDC, or manufacturer…"
+          style={{...S.input,paddingRight:36,background:value?'#F0FDF4':'white',borderColor:value?'#86EFAC':'#CBD5E1'}}/>
+        {(query||value)&&<button onClick={clear} style={{position:'absolute',right:8,top:'50%',transform:'translateY(-50%)',background:'none',border:'none',color:'#94A3B8',cursor:'pointer',fontSize:16,padding:2}}>✕</button>}
+      </div>
+      {open&&filtered.length>0&&(
+        <div style={{position:'absolute',top:'calc(100% + 4px)',left:0,right:0,background:'white',borderRadius:12,boxShadow:'0 8px 24px rgba(0,0,0,0.15)',zIndex:999,maxHeight:280,overflowY:'auto',border:'1px solid #E2E8F0'}}>
+          {query.trim().length===0&&<div style={{padding:'8px 14px 4px',fontSize:10,fontWeight:700,color:'#94A3B8',textTransform:'uppercase',letterSpacing:'0.06em',position:'sticky',top:0,background:'white',borderBottom:'1px solid #F1F5F9'}}>All {DRUG_MASTER.length} Drugs — scroll or type to filter</div>}
+          {filtered.map(d=>(
+            <div key={d.ndc} onClick={()=>select(d)} style={{padding:'10px 14px',cursor:'pointer',borderBottom:'1px solid #F8FAFC'}}
+              onMouseEnter={e=>e.currentTarget.style.background='#F0F9FF'}
+              onMouseLeave={e=>e.currentTarget.style.background='white'}>
+              <div style={{fontSize:13,fontWeight:600,color:'#1E293B'}}>{hl(d.name,query)}</div>
+              <div style={{display:'flex',gap:10,marginTop:2}}>
+                <span style={{fontSize:11,color:'#64748B',fontFamily:'monospace'}}>{fmtNDC(d.ndc)}</span>
+                <span style={{fontSize:11,color:'#94A3B8'}}>{d.mfr}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      {value&&ndc&&(
+        <div style={{marginTop:5,display:'flex',gap:8,alignItems:'center'}}>
+          <div style={{fontSize:11,background:'#F0FDF4',border:'1px solid #86EFAC',borderRadius:6,padding:'3px 8px',color:'#065F46',fontFamily:'monospace',fontWeight:600}}>NDC: {fmtNDC(ndc)}</div>
+          {DRUG_MASTER.find(d=>d.ndc===ndc)?.mfr&&<div style={{fontSize:11,color:'#64748B'}}>{DRUG_MASTER.find(d=>d.ndc===ndc).mfr}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════
+// SETUP SCREEN — first-launch white-label onboarding
+// ══════════════════════════════════════════════════════
+function SetupScreen({onComplete}){
+  const[orgName,setOrgName]=useState('');
+  const[orgShort,setOrgShort]=useState('');
+  const[billingEmail,setBillingEmail]=useState('');
+  const[err,setErr]=useState('');
+  const[step,setStep]=useState(1);
+
+  const next=()=>{
+    if(!orgName.trim()){setErr('Please enter your organization name.');return;}
+    setErr('');
+    // Auto-suggest short code from first letters of org words
+    if(!orgShort){
+      const auto=orgName.trim().split(/\s+/).map(w=>w[0]?.toUpperCase()||'').join('').slice(0,6);
+      setOrgShort(auto);
+    }
+    setStep(2);
+  };
+  const finish=()=>{
+    if(!billingEmail.trim()||!billingEmail.includes('@')){setErr('Please enter a valid billing email.');return;}
+    const cfg={orgName:orgName.trim(),orgShort:(orgShort||'ORG').trim().toUpperCase(),billingEmail:billingEmail.trim(),setupDone:true};
+    saveConfig(cfg);
+    onComplete(cfg);
+  };
+
+  return(
+    <div style={{minHeight:'100vh',background:'linear-gradient(160deg,#0F1E4A 0%,#1B2B5E 50%,#2E4FAF 100%)',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:24}}>
+      {/* Logo block */}
+      <div style={{textAlign:'center',marginBottom:36}}>
+        <div style={{fontSize:11,color:'rgba(255,255,255,0.5)',textTransform:'uppercase',letterSpacing:'0.14em',marginBottom:8}}>Welcome to</div>
+        <div style={{fontSize:52,fontWeight:900,color:'white',letterSpacing:'-0.03em',lineHeight:1}}>RxRunner</div>
+        <div style={{fontSize:14,color:'rgba(255,255,255,0.6)',marginTop:6,fontStyle:'italic'}}>Pharmaceutical Delivery Management</div>
+      </div>
+
+      <div style={{background:'white',borderRadius:20,padding:28,width:'100%',maxWidth:400,boxShadow:'0 24px 64px rgba(0,0,0,0.35)'}}>
+        {/* Step indicator */}
+        <div style={{display:'flex',gap:6,marginBottom:24,justifyContent:'center'}}>
+          {[1,2].map(s=>(
+            <div key={s} style={{height:4,flex:1,borderRadius:4,background:step>=s?'#1B2B5E':'#E2E8F0',transition:'background 0.3s'}}/>
+          ))}
+        </div>
+
+        {step===1&&(
+          <>
+            <div style={{fontSize:18,fontWeight:800,color:'#1B2B5E',marginBottom:4}}>Set Up Your Organization</div>
+            <div style={{fontSize:13,color:'#64748B',marginBottom:20,lineHeight:1.5}}>This name appears at the top of the app and on all reports. You can change it later in Settings.</div>
+            <div style={{marginBottom:12}}>
+              <div style={{fontSize:12,fontWeight:600,color:'#475569',marginBottom:5}}>Organization Name <span style={{color:'#EF4444'}}>*</span></div>
+              <input value={orgName} onChange={e=>setOrgName(e.target.value)} onKeyDown={e=>e.key==='Enter'&&next()}
+                placeholder="e.g. Central Florida Rheumatology Consultants"
+                style={{width:'100%',padding:'12px 14px',border:'1.5px solid #CBD5E1',borderRadius:10,fontSize:14,fontFamily:'inherit',boxSizing:'border-box',outline:'none'}}
+                autoFocus/>
+            </div>
+            <div style={{marginBottom:20}}>
+              <div style={{fontSize:12,fontWeight:600,color:'#475569',marginBottom:5}}>Short Code <span style={{fontSize:11,color:'#94A3B8',fontWeight:400}}>(used in exported filenames)</span></div>
+              <input value={orgShort} onChange={e=>setOrgShort(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,8))}
+                placeholder="e.g. CFRC  (auto-filled if blank)"
+                style={{width:'100%',padding:'12px 14px',border:'1.5px solid #CBD5E1',borderRadius:10,fontSize:14,fontFamily:'monospace',boxSizing:'border-box',outline:'none'}}/>
+            </div>
+            {err&&<div style={{background:'#FEF2F2',border:'1px solid #FECACA',borderRadius:8,padding:'10px 12px',color:'#991B1B',fontSize:12,marginBottom:14}}>{err}</div>}
+            <button onClick={next} style={{width:'100%',padding:'15px',background:'linear-gradient(135deg,#1B2B5E,#2E4FAF)',border:'none',borderRadius:12,color:'white',fontSize:15,fontWeight:700,cursor:'pointer',fontFamily:'inherit'}}>
+              Next →
+            </button>
+          </>
+        )}
+
+        {step===2&&(
+          <>
+            <div style={{fontSize:18,fontWeight:800,color:'#1B2B5E',marginBottom:4}}>Invoice & Billing</div>
+            <div style={{fontSize:13,color:'#64748B',marginBottom:20,lineHeight:1.5}}>The email address where the driver will send biweekly invoices.</div>
+            <div style={{background:'#F0F9FF',border:'1px solid #BAE6FD',borderRadius:10,padding:'12px 14px',marginBottom:16}}>
+              <div style={{fontSize:11,fontWeight:700,color:'#0369A1',marginBottom:2}}>Confirmed</div>
+              <div style={{fontSize:14,fontWeight:600,color:'#1E293B'}}>{orgName}</div>
+              {orgShort&&<div style={{fontSize:11,color:'#64748B',marginTop:2,fontFamily:'monospace'}}>Short code: {orgShort}</div>}
+            </div>
+            <div style={{marginBottom:20}}>
+              <div style={{fontSize:12,fontWeight:600,color:'#475569',marginBottom:5}}>Billing / Finance Email <span style={{color:'#EF4444'}}>*</span></div>
+              <input value={billingEmail} onChange={e=>setBillingEmail(e.target.value)} onKeyDown={e=>e.key==='Enter'&&finish()}
+                placeholder="e.g. billing@yourorg.com"
+                type="email"
+                style={{width:'100%',padding:'12px 14px',border:'1.5px solid #CBD5E1',borderRadius:10,fontSize:14,fontFamily:'inherit',boxSizing:'border-box',outline:'none'}}
+                autoFocus/>
+            </div>
+            {err&&<div style={{background:'#FEF2F2',border:'1px solid #FECACA',borderRadius:8,padding:'10px 12px',color:'#991B1B',fontSize:12,marginBottom:14}}>{err}</div>}
+            <div style={{display:'flex',gap:10}}>
+              <button onClick={()=>{setStep(1);setErr('');}} style={{flex:1,padding:'15px',background:'#F1F5F9',border:'none',borderRadius:12,color:'#475569',fontSize:14,fontWeight:600,cursor:'pointer',fontFamily:'inherit'}}>← Back</button>
+              <button onClick={finish} style={{flex:2,padding:'15px',background:'linear-gradient(135deg,#059669,#047857)',border:'none',borderRadius:12,color:'white',fontSize:15,fontWeight:700,cursor:'pointer',fontFamily:'inherit'}}>Launch RxRunner ✓</button>
+            </div>
+          </>
+        )}
+      </div>
+      <div style={{marginTop:20,fontSize:11,color:'rgba(255,255,255,0.35)',textAlign:'center'}}>You can change these settings anytime from the Home screen.</div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════
+// SETTINGS MODAL — edit org name / billing email anytime
+// ══════════════════════════════════════════════════════
+function SettingsModal({config,onSave,onClose,onReset}){
+  const[orgName,setOrgName]=useState(config.orgName||'');
+  const[orgShort,setOrgShort]=useState(config.orgShort||'');
+  const[billingEmail,setBillingEmail]=useState(config.billingEmail||'');
+  const[hourlyRate,setHourlyRate]=useState(String(config.hourlyRate||HOURLY_RATE_DEFAULT));
+  const[err,setErr]=useState('');
+  const[confirmReset,setConfirmReset]=useState(false);
+
+  const save=()=>{
+    if(!orgName.trim()){setErr('Organization name is required.');return;}
+    if(!billingEmail.trim()||!billingEmail.includes('@')){setErr('Valid billing email required.');return;}
+    const hr=parseFloat(hourlyRate);
+    if(isNaN(hr)||hr<=0){setErr('Enter a valid hourly rate.');return;}
+    const cfg={orgName:orgName.trim(),orgShort:(orgShort||'ORG').trim().toUpperCase(),billingEmail:billingEmail.trim(),hourlyRate:hr,setupDone:true};
+    saveConfig(cfg);
+    onSave(cfg);
+  };
+
+  return(
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.65)',zIndex:2000,display:'flex',alignItems:'flex-end',justifyContent:'center'}}
+      onClick={e=>{if(e.target===e.currentTarget)onClose();}}>
+      <div style={{background:'white',borderRadius:'20px 20px 0 0',padding:24,width:'100%',maxWidth:480,boxShadow:'0 -8px 40px rgba(0,0,0,0.25)',maxHeight:'90vh',overflowY:'auto'}}>
+        <div style={{width:40,height:4,background:'#E2E8F0',borderRadius:4,margin:'0 auto 20px'}}/>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:20}}>
+          <div style={{fontSize:18,fontWeight:800,color:'#1B2B5E'}}>⚙️ RxRunner Settings</div>
+          <button onClick={onClose} style={{background:'none',border:'none',fontSize:20,color:'#94A3B8',cursor:'pointer',padding:4}}>✕</button>
+        </div>
+
+        <div style={{marginBottom:12}}>
+          <div style={{fontSize:12,fontWeight:600,color:'#475569',marginBottom:5}}>Organization Name</div>
+          <input value={orgName} onChange={e=>setOrgName(e.target.value)}
+            style={{width:'100%',padding:'11px 13px',border:'1.5px solid #CBD5E1',borderRadius:9,fontSize:14,fontFamily:'inherit',boxSizing:'border-box',outline:'none'}}/>
+        </div>
+        <div style={{marginBottom:12}}>
+          <div style={{fontSize:12,fontWeight:600,color:'#475569',marginBottom:5}}>Short Code <span style={{fontSize:11,color:'#94A3B8',fontWeight:400}}>(CSV filenames)</span></div>
+          <input value={orgShort} onChange={e=>setOrgShort(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,8))}
+            style={{width:'100%',padding:'11px 13px',border:'1.5px solid #CBD5E1',borderRadius:9,fontSize:14,fontFamily:'monospace',boxSizing:'border-box',outline:'none'}}/>
+        </div>
+        <div style={{marginBottom:20}}>
+          <div style={{fontSize:12,fontWeight:600,color:'#475569',marginBottom:5}}>Billing / Invoice Email</div>
+          <input value={billingEmail} onChange={e=>setBillingEmail(e.target.value)} type="email"
+            style={{width:'100%',padding:'11px 13px',border:'1.5px solid #CBD5E1',borderRadius:9,fontSize:14,fontFamily:'inherit',boxSizing:'border-box',outline:'none'}}/>
+        </div>
+        <div style={{marginBottom:20}}>
+          <div style={{fontSize:12,fontWeight:600,color:'#475569',marginBottom:5}}>Contractor Hourly Rate <span style={{fontSize:11,color:'#94A3B8',fontWeight:400}}>($/hr)</span></div>
+          <input value={hourlyRate} onChange={e=>setHourlyRate(e.target.value)} type="number" step="0.25"
+            style={{width:'100%',padding:'11px 13px',border:'1.5px solid #CBD5E1',borderRadius:9,fontSize:14,fontFamily:'inherit',boxSizing:'border-box',outline:'none'}}/>
+          <div style={{fontSize:11,color:'#94A3B8',marginTop:4}}>Mileage locked at $0.725/mi (2026 IRS standard rate)</div>
+        </div>
+        </div>
+        {err&&<div style={{background:'#FEF2F2',border:'1px solid #FECACA',borderRadius:8,padding:'10px 12px',color:'#991B1B',fontSize:12,marginBottom:14}}>{err}</div>}
+        <button onClick={save} style={{width:'100%',padding:'14px',background:'linear-gradient(135deg,#1B2B5E,#2E4FAF)',border:'none',borderRadius:12,color:'white',fontSize:14,fontWeight:700,cursor:'pointer',fontFamily:'inherit',marginBottom:10}}>
+          Save Changes
+        </button>
+
+        <div style={{borderTop:'1px solid #F1F5F9',paddingTop:14,marginTop:6}}>
+          {!confirmReset
+            ?<button onClick={()=>setConfirmReset(true)} style={{width:'100%',padding:'11px',background:'none',border:'1px solid #FECACA',borderRadius:10,color:'#DC2626',fontSize:13,cursor:'pointer',fontFamily:'inherit'}}>
+                Reset Setup — Run Onboarding Again
+              </button>
+            :<div style={{background:'#FEF2F2',borderRadius:10,padding:'14px',border:'1px solid #FECACA'}}>
+                <div style={{fontSize:13,color:'#991B1B',fontWeight:600,marginBottom:10}}>This clears your organization config and shows the setup screen on next launch. Your delivery data is NOT deleted. Are you sure?</div>
+                <div style={{display:'flex',gap:8}}>
+                  <button onClick={()=>setConfirmReset(false)} style={{flex:1,padding:'10px',background:'#F1F5F9',border:'none',borderRadius:8,color:'#475569',cursor:'pointer',fontFamily:'inherit',fontSize:13}}>Cancel</button>
+                  <button onClick={()=>{LS.set('rxrunner:config',{...config,setupDone:false});onReset();}} style={{flex:1,padding:'10px',background:'#DC2626',border:'none',borderRadius:8,color:'white',cursor:'pointer',fontFamily:'inherit',fontSize:13,fontWeight:700}}>Reset</button>
+                </div>
+              </div>
+          }
+        </div>
+        <div style={{fontSize:11,color:'#94A3B8',textAlign:'center',marginTop:14}}>RxRunner v3.0 · Powered by BioCalibrate</div>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════
+// SECURE CONTEXT BANNER — shown when running from local file
+// ══════════════════════════════════════════════════════
+function SecureContextBanner(){
+  const[dismissed,setDismissed]=useState(false);
+  if(isSecure()||dismissed)return null;
+  return(
+    <div style={{background:'#FFF7ED',borderBottom:'2px solid #FED7AA',padding:'12px 16px',display:'flex',gap:10,alignItems:'flex-start'}}>
+      <div style={{fontSize:18,flexShrink:0}}>⚠️</div>
+      <div style={{flex:1}}>
+        <div style={{fontSize:13,fontWeight:700,color:'#C2410C',marginBottom:3}}>GPS & Home Screen Install Unavailable</div>
+        <div style={{fontSize:11,color:'#92400E',lineHeight:1.5}}>
+          You opened this file directly (local file/OneDrive). GPS and "Add to Home Screen" require HTTPS.
+          <br/><strong>Fix:</strong> Host this file on Firebase (free) and open via the HTTPS URL. See User Guide Section 6 for step-by-step instructions. Until then, use <strong>Time-Only Mode</strong> on the Tracker.
+        </div>
+      </div>
+      <button onClick={()=>setDismissed(true)} style={{background:'none',border:'none',color:'#C2410C',fontSize:16,cursor:'pointer',padding:2,flexShrink:0}}>✕</button>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════
+// HOME SCREEN
+// ══════════════════════════════════════════════════════
+function HomeScreen({sessions,coldChainLogs,manifests,isTracking,elapsed,totalMiles,go,runs,fbMode,config,onSettings}){
+  const hr=getHourlyRate(config),mr=getMileRate(config);
+  const todayStr=fmtD(Date.now());
+  const ts=sessions.filter(s=>s.date===todayStr);
+  const tHrs=ts.reduce((a,s)=>a+s.totalSeconds/3600,0)+(isTracking?elapsed/3600:0);
+  const tMi=ts.reduce((a,s)=>a+s.totalMiles,0)+(isTracking?totalMiles:0);
+  const upcomingRuns=runs.filter(r=>r.date>=todayISO()).sort((a,b)=>a.date.localeCompare(b.date));
+  const pendingLogs=coldChainLogs.filter(l=>l.status==='pending');
+  return(
+    <div style={{paddingBottom:90}}>
+      <SecureContextBanner/>
+      <div style={{background:'linear-gradient(135deg,#1B2B5E 0%,#2E4FAF 100%)',padding:'28px 20px 20px',color:'white'}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:2}}>
+          <div style={{flex:1,minWidth:0}}>
+            <div style={{fontSize:10,opacity:0.6,letterSpacing:'0.08em',textTransform:'uppercase',marginBottom:4,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{config?.orgName||'Your Organization'}</div>
+            <div style={{fontSize:26,fontWeight:900,letterSpacing:'-0.02em',lineHeight:1}}>RxRunner</div>
+            <div style={{fontSize:13,opacity:0.7,marginTop:2,fontStyle:'italic'}}>Pharmaceutical Delivery</div>
+          </div>
+          <button onClick={onSettings} style={{background:'rgba(255,255,255,0.15)',border:'1px solid rgba(255,255,255,0.25)',borderRadius:10,color:'white',fontSize:18,cursor:'pointer',padding:'8px 10px',flexShrink:0,marginLeft:12,marginTop:2}} title="Settings">⚙️</button>
+        </div>
+        <div style={{fontSize:12,opacity:0.7,marginTop:8}}>{new Date().toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric',year:'numeric'})}</div>
+        <div style={{marginTop:8,display:'inline-flex',alignItems:'center',gap:6,background:'rgba(255,255,255,0.12)',borderRadius:20,padding:'4px 12px'}}>
+          <div style={{width:6,height:6,borderRadius:'50%',background:fbMode?'#86EFAC':'#FDE68A'}}/>
+          <span style={{fontSize:10,fontWeight:600,letterSpacing:'0.04em'}}>{fbMode?'ONLINE — Synced':'OFFLINE — Local Only'}</span>
+        </div>
+      </div>
+      {isTracking&&<div style={{background:'#ECFDF5',border:'1px solid #6EE7B7',borderRadius:12,margin:'14px 14px 0',padding:'12px 14px',display:'flex',alignItems:'center',gap:10}}>
+        <div style={{width:10,height:10,borderRadius:'50%',background:'#10B981',animation:'pulse 1.5s ease-in-out infinite',flexShrink:0}}/>
+        <div><div style={{fontSize:13,fontWeight:700,color:'#065F46'}}>Session Active</div><div style={{fontSize:12,color:'#047857'}}>{fmtT(elapsed)} · {totalMiles.toFixed(2)} mi</div></div>
+        <button onClick={()=>go('tracker')} style={{marginLeft:'auto',background:'#059669',border:'none',borderRadius:8,color:'white',fontSize:12,fontWeight:600,padding:'6px 12px',cursor:'pointer',fontFamily:'inherit'}}>View</button>
+      </div>}
+      {pendingLogs.length>0&&<div style={{margin:'14px 14px 0',background:'#FFFBEB',border:'1px solid #FDE68A',borderRadius:12,padding:'12px 14px'}}>
+        <div style={{fontSize:11,fontWeight:700,color:'#D97706',textTransform:'uppercase',letterSpacing:'0.06em',marginBottom:6}}>⏳ {pendingLogs.length} Pending Cold Chain Log{pendingLogs.length!==1?'s':''}</div>
+        {pendingLogs.map(l=><div key={l.id} style={{fontSize:12,color:'#92400E',marginBottom:3}}>→ {l.dest} ({l.drugs?.length||1} drug{(l.drugs?.length||1)!==1?'s':''})</div>)}
+        <button onClick={()=>go('coldchain')} style={{marginTop:6,background:'#D97706',border:'none',borderRadius:8,color:'white',fontSize:12,fontWeight:600,padding:'7px 14px',cursor:'pointer',fontFamily:'inherit'}}>Complete Delivery →</button>
+      </div>}
+      {upcomingRuns.length>0&&<div style={{margin:'14px 14px 0',background:'#EFF6FF',border:'1px solid #BFDBFE',borderRadius:12,padding:'12px 14px'}}>
+        <div style={{fontSize:11,fontWeight:700,color:'#1E40AF',textTransform:'uppercase',letterSpacing:'0.06em',marginBottom:6}}>📦 {upcomingRuns.length} Upcoming Run{upcomingRuns.length!==1?'s':''}</div>
+        {upcomingRuns.map(r=><div key={r.id} style={{fontSize:12,color:'#1E40AF',marginBottom:3}}>→ {new Date(r.date+'T12:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric'})} · {r.stops.length} stop{r.stops.length!==1?'s':''}: {r.stops.map(s=>s.location.replace('Kissimmee — ','')).join(', ')}</div>)}
+        <button onClick={()=>go('coldchain')} style={{marginTop:6,background:'#1D4ED8',border:'none',borderRadius:8,color:'white',fontSize:12,fontWeight:600,padding:'7px 14px',cursor:'pointer',fontFamily:'inherit'}}>Open Cold Chain →</button>
+      </div>}
+      <div style={{padding:'14px 14px 0'}}>
+        <div style={S.lbl}>Today's Summary</div>
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:10,marginBottom:16}}>
+          {[{l:'Hours',v:tHrs.toFixed(2),i:'⏱'},{l:'Miles',v:tMi.toFixed(1),i:'📍'},{l:'Est. Pay',v:cur(tHrs*hr+tMi*mr),i:'💵'}].map(({l,v,i})=>(
+            <div key={l} style={{background:'white',borderRadius:12,padding:'14px 8px',textAlign:'center',boxShadow:'0 1px 4px rgba(0,0,0,0.06)'}}>
+              <div style={{fontSize:22,marginBottom:4}}>{i}</div>
+              <div style={{fontSize:17,fontWeight:800,color:'#1B2B5E'}}>{v}</div>
+              <div style={{fontSize:10,color:'#94A3B8',marginTop:2,textTransform:'uppercase',letterSpacing:'0.04em'}}>{l}</div>
+            </div>
+          ))}
+        </div>
+        {[
+          {id:'tracker',i:'⏱',l:'Time & Mileage Tracker',sub:isTracking?'● Session in progress':'Start your shift',c:'#1B2B5E'},
+          {id:'coldchain',i:'🌡',l:'Cold Chain Log',sub:`${coldChainLogs.filter(l=>l.status==='complete').length} complete · ${pendingLogs.length} pending`,c:'#0369A1'},
+          {id:'manifest',i:'📋',l:'Delivery Manifest',sub:`${manifests.length} manifest${manifests.length!==1?'s':''} completed`,c:'#6D28D9'},
+          {id:'invoice',i:'📄',l:'Submit Invoice',sub:'Generate biweekly pay report',c:'#059669'},
+        ].map(({id,i,l,sub,c})=>(
+          <button key={id} onClick={()=>go(id)} style={{display:'flex',alignItems:'center',gap:12,padding:'13px 14px',background:'white',border:'none',borderRadius:12,cursor:'pointer',textAlign:'left',boxShadow:'0 1px 4px rgba(0,0,0,0.06)',width:'100%',fontFamily:'inherit',marginBottom:9}}>
+            <div style={{width:44,height:44,borderRadius:10,background:`${c}18`,display:'flex',alignItems:'center',justifyContent:'center',fontSize:20,flexShrink:0}}>{i}</div>
+            <div style={{flex:1}}><div style={{fontSize:14,fontWeight:600,color:'#1E293B'}}>{l}</div><div style={{fontSize:12,color:'#94A3B8',marginTop:2}}>{sub}</div></div>
+            <div style={{color:'#CBD5E1',fontSize:20}}>›</div>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════
+// TRACKER SCREEN — wall-clock timer + GPS/Time-Only mode
+// ══════════════════════════════════════════════════════
+// ── Device detection helpers ──────────────────────────────────────────────
+const isIOS=()=>/iphone|ipad|ipod/i.test(navigator.userAgent);
+const isAndroid=()=>/android/i.test(navigator.userAgent);
+
+// ── Background Guide Modal ────────────────────────────────────────────────
+function BgGuideModal({onClose}){
+  const ios=isIOS();
+  const android=isAndroid();
+  const steps=ios?[
+    {icon:'🏠',title:'Press the Home Button',desc:'Tap the home button (or swipe up from the very bottom edge and pause) to go to your home screen. RxRunner stays running.'},
+    {icon:'📲',title:'Use Other Apps Normally',desc:'Open Messages, Maps, or any other app. RxRunner continues tracking in the background.'},
+    {icon:'🟢',title:'Return to RxRunner',desc:'Tap the RxRunner icon on your home screen — just like opening any app. Your session will be exactly where you left it.'},
+    {icon:'⚠️',title:'Do NOT do this',desc:'Never swipe up and flick the RxRunner card away in the app switcher. That force-closes it. If you accidentally do, just reopen — your session auto-restores.'},
+  ]:android?[
+    {icon:'🏠',title:'Press the Home Button',desc:'Tap the circle home button or swipe up to go to your home screen. RxRunner keeps running.'},
+    {icon:'📲',title:'Use Other Apps Normally',desc:'Open any other app. RxRunner continues tracking GPS and time in the background.'},
+    {icon:'🟢',title:'Return to RxRunner',desc:'Tap the RxRunner icon on your home screen or pull up recent apps and tap RxRunner. Session continues uninterrupted.'},
+    {icon:'⚠️',title:'Avoid Force-Closing',desc:'Don\'t swipe RxRunner away in the recent apps drawer mid-run. If you do, just reopen the app — it will auto-restore your session.'},
+  ]:[
+    {icon:'🏠',title:'Use the Home Button',desc:'Press your device\'s home button or swipe to the home screen. Don\'t close the browser tab — just go home.'},
+    {icon:'📲',title:'Use Other Apps',desc:'Open whatever you need. RxRunner keeps the session alive.'},
+    {icon:'🟢',title:'Come Back via Icon',desc:'Tap the RxRunner icon on your home screen to return instantly.'},
+    {icon:'⚠️',title:'Don\'t Close the Tab',desc:'Avoid closing the browser tab or swiping the app away in the task switcher mid-run.'},
+  ];
+  return(
+    <div style={{position:'fixed',inset:0,zIndex:9999,display:'flex',flexDirection:'column',justifyContent:'flex-end'}} onClick={onClose}>
+      <div style={{background:'rgba(0,0,0,0.5)',position:'absolute',inset:0}}/>
+      <div style={{position:'relative',background:'white',borderRadius:'20px 20px 0 0',padding:'0 0 40px',maxHeight:'85vh',overflowY:'auto'}} onClick={e=>e.stopPropagation()}>
+        {/* Handle bar */}
+        <div style={{display:'flex',justifyContent:'center',padding:'12px 0 4px'}}>
+          <div style={{width:36,height:4,borderRadius:2,background:'#CBD5E1'}}/>
+        </div>
+        {/* Header */}
+        <div style={{background:'linear-gradient(135deg,#1B2B5E,#2E4FAF)',margin:'8px 16px 0',borderRadius:14,padding:'16px',color:'white',textAlign:'center'}}>
+          <div style={{fontSize:28,marginBottom:6}}>📱</div>
+          <div style={{fontSize:17,fontWeight:900,letterSpacing:'-0.02em'}}>Move to Background</div>
+          <div style={{fontSize:12,opacity:0.8,marginTop:4}}>RxRunner keeps tracking while you use other apps</div>
+        </div>
+        {/* Device badge */}
+        <div style={{display:'flex',justifyContent:'center',margin:'14px 0 4px'}}>
+          <div style={{background:ios?'#000':android?'#3DDC84':'#64748B',color:'white',borderRadius:20,padding:'4px 14px',fontSize:11,fontWeight:700}}>
+            {ios?'iPhone / iOS':android?'Android':'Your Device'}
+          </div>
+        </div>
+        {/* Steps */}
+        <div style={{padding:'4px 16px 0'}}>
+          {steps.map((s,i)=>(
+            <div key={i} style={{display:'flex',gap:14,padding:'14px 0',borderBottom:i<steps.length-1?'1px solid #F1F5F9':'none'}}>
+              <div style={{fontSize:26,flexShrink:0,width:36,textAlign:'center',paddingTop:2}}>{s.icon}</div>
+              <div>
+                <div style={{fontSize:13,fontWeight:700,color:s.icon==='⚠️'?'#DC2626':'#1B2B5E',marginBottom:3}}>{s.title}</div>
+                <div style={{fontSize:12,color:'#64748B',lineHeight:1.55}}>{s.desc}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+        {/* CTA */}
+        <div style={{padding:'16px 16px 0'}}>
+          <div style={{background:'#ECFDF5',border:'1px solid #6EE7B7',borderRadius:12,padding:'12px 14px',display:'flex',gap:10,alignItems:'flex-start',marginBottom:16}}>
+            <span style={{fontSize:16}}>💡</span>
+            <div style={{fontSize:12,color:'#065F46',lineHeight:1.5}}>A notification has been sent to your phone. Tap it anytime to jump straight back to RxRunner.</div>
+          </div>
+          <button onClick={onClose} style={{width:'100%',padding:'15px',background:'linear-gradient(135deg,#1B2B5E,#2E4FAF)',border:'none',borderRadius:12,color:'white',fontSize:15,fontWeight:800,cursor:'pointer',fontFamily:'inherit',letterSpacing:'-0.01em'}}>
+            Got it — Go to Home Screen
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── First-Time Tutorial Overlay ───────────────────────────────────────────
+function BgTutorial({onDismiss}){
+  return(
+    <div style={{position:'fixed',inset:0,zIndex:9998,background:'rgba(15,23,42,0.85)',display:'flex',alignItems:'center',justifyContent:'center',padding:20}}>
+      <div style={{background:'white',borderRadius:20,padding:'24px 20px',maxWidth:340,width:'100%'}}>
+        <div style={{textAlign:'center',marginBottom:16}}>
+          <div style={{fontSize:40,marginBottom:8}}>🏃</div>
+          <div style={{fontSize:18,fontWeight:900,color:'#1B2B5E',letterSpacing:'-0.02em'}}>Session Started!</div>
+          <div style={{fontSize:13,color:'#64748B',marginTop:6,lineHeight:1.5}}>Need to use another app during your run? Use the <strong style={{color:'#1B2B5E'}}>Move to Background</strong> button — don't swipe this app away.</div>
+        </div>
+        <div style={{background:'#F8FAFC',borderRadius:12,padding:'12px 14px',marginBottom:16}}>
+          <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:8}}>
+            <span style={{fontSize:18}}>✅</span>
+            <span style={{fontSize:12,color:'#059669',fontWeight:600}}>Home button → use other apps → tap RxRunner icon to return</span>
+          </div>
+          <div style={{display:'flex',alignItems:'center',gap:10}}>
+            <span style={{fontSize:18}}>❌</span>
+            <span style={{fontSize:12,color:'#DC2626',fontWeight:600}}>Swiping the app away in the task switcher ends GPS tracking</span>
+          </div>
+        </div>
+        <button onClick={onDismiss} style={{width:'100%',padding:'14px',background:'linear-gradient(135deg,#059669,#047857)',border:'none',borderRadius:12,color:'white',fontSize:14,fontWeight:800,cursor:'pointer',fontFamily:'inherit'}}>
+          Got it — Start Tracking
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Manual Entry Form ─────────────────────────────────────────────────────
+function ManualEntryForm({onSave,onCancel,config}){
+  const todayVal=new Date().toISOString().slice(0,10);
+  const[date,setDate]=useState(todayVal);
+  const[startT,setStartT]=useState('');
+  const[endT,setEndT]=useState('');
+  const[startOdo,setStartOdo]=useState('');
+  const[endOdo,setEndOdo]=useState('');
+  const[tollAmt,setTollAmt]=useState('');
+  const[notes,setNotes]=useState('');
+  const calcMiles=()=>{const s=parseFloat(startOdo),e=parseFloat(endOdo);return(!isNaN(s)&&!isNaN(e)&&e>=s)?e-s:null;};
+  const calcSecs=()=>{
+    if(!startT||!endT)return null;
+    const[sh,sm]=startT.split(':').map(Number);
+    const[eh,em]=endT.split(':').map(Number);
+    let s=(eh*60+em-(sh*60+sm))*60;
+    if(s<0)s+=86400; // past midnight
+    return s>0?s:null;
+  };
+  const miles=calcMiles(),secs=calcSecs();
+  const hr=getHourlyRate(config),mr=getMileRate(config);
+  const estPay=secs!=null&&miles!=null?cur((secs/3600)*hr+miles*mr):null;
+  const save=()=>{
+    if(!date){alert('Select a date.');return;}
+    if(!startT||!endT){alert('Enter start and end time.');return;}
+    if(secs==null||secs<=0){alert('End time must be after start time.');return;}
+    if(!startOdo&&!endOdo&&miles==null){alert('Enter start and end odometer, or at least one mileage value.');return;}
+    // Build timestamps from date + time strings
+    const mkTs=(d,t)=>new Date(`${d}T${t}:00`).getTime();
+    const startTs=mkTs(date,startT),endTs=mkTs(date,endT);
+    const finalMiles=miles!==null?miles:0;
+    const toll=parseFloat(tollAmt)||0;
+    onSave({date,startTs,endTs,secs,miles:finalMiles,toll,notes,startOdo,endOdo});
+  };
+  return(
+    <div style={{background:'#FFFBEB',border:'2px solid #FDE68A',borderRadius:14,padding:'16px',marginBottom:12}}>
+      <div style={{fontSize:14,fontWeight:800,color:'#92400E',marginBottom:12}}>📝 Log Manual Entry</div>
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,marginBottom:8}}>
+        <div><div style={{fontSize:11,fontWeight:600,color:'#64748B',marginBottom:4}}>Date</div>
+          <input type="date" value={date} onChange={e=>setDate(e.target.value)} style={{...S.input,fontSize:13}}/></div>
+        <div><div style={{fontSize:11,fontWeight:600,color:'#64748B',marginBottom:4}}>Toll Charges ($)</div>
+          <input type="number" value={tollAmt} onChange={e=>setTollAmt(e.target.value)} placeholder="0.00" step="0.01" style={{...S.input,fontSize:13}}/></div>
+      </div>
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,marginBottom:8}}>
+        <div><div style={{fontSize:11,fontWeight:600,color:'#64748B',marginBottom:4}}>Start Time</div>
+          <input type="time" value={startT} onChange={e=>setStartT(e.target.value)} style={{...S.input,fontSize:13}}/></div>
+        <div><div style={{fontSize:11,fontWeight:600,color:'#64748B',marginBottom:4}}>End Time</div>
+          <input type="time" value={endT} onChange={e=>setEndT(e.target.value)} style={{...S.input,fontSize:13}}/></div>
+      </div>
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,marginBottom:8}}>
+        <div><div style={{fontSize:11,fontWeight:600,color:'#64748B',marginBottom:4}}>Start Odometer</div>
+          <input type="number" value={startOdo} onChange={e=>setStartOdo(e.target.value)} placeholder="e.g. 42150" style={{...S.input,fontSize:13}}/></div>
+        <div><div style={{fontSize:11,fontWeight:600,color:'#64748B',marginBottom:4}}>End Odometer</div>
+          <input type="number" value={endOdo} onChange={e=>setEndOdo(e.target.value)} placeholder="e.g. 42218" style={{...S.input,fontSize:13}}/></div>
+      </div>
+      {(miles!==null||secs!==null)&&(
+        <div style={{background:'#F0FDF4',border:'1px solid #BBF7D0',borderRadius:10,padding:'10px 12px',marginBottom:8,fontSize:12,color:'#065F46'}}>
+          {secs!=null&&<span>⏱ {fmtT(secs)}</span>}{miles!==null&&<span style={{marginLeft:12}}>📍 {miles.toFixed(2)} mi</span>}{estPay&&<span style={{marginLeft:12,fontWeight:700}}>💵 {estPay} est.</span>}
+        </div>
+      )}
+      <div style={{marginBottom:10}}><div style={{fontSize:11,fontWeight:600,color:'#64748B',marginBottom:4}}>Notes (optional)</div>
+        <input type="text" value={notes} onChange={e=>setNotes(e.target.value)} placeholder="e.g. GPS lost during call — manual entry" style={{...S.input,fontSize:12}}/></div>
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
+        <button onClick={onCancel} style={{...S.btnSm,background:'white',border:'1px solid #CBD5E1',color:'#475569'}}>Cancel</button>
+        <button onClick={save} style={{...S.btnSm,background:'linear-gradient(135deg,#D97706,#B45309)',color:'white',border:'none',fontWeight:700}}>✔ Save Entry</button>
+      </div>
+    </div>
+  );
+}
+
+// ── Add Toll Modal ────────────────────────────────────────────────────────
+function AddTollModal({onSave,onCancel}){
+  const todayVal=new Date().toISOString().slice(0,10);
+  const[date,setDate]=useState(todayVal);
+  const[amount,setAmount]=useState('');
+  const[notes,setNotes]=useState('');
+  const save=()=>{
+    if(!amount||isNaN(parseFloat(amount))||parseFloat(amount)<=0){alert('Enter a valid toll amount.');return;}
+    onSave({id:Date.now(),date,amount:parseFloat(amount),notes,paid:false});
+  };
+  return(
+    <div style={{position:'fixed',inset:0,zIndex:9990,display:'flex',alignItems:'flex-end',justifyContent:'center'}} onClick={onCancel}>
+      <div style={{background:'rgba(0,0,0,0.4)',position:'absolute',inset:0}}/>
+      <div style={{position:'relative',background:'white',borderRadius:'20px 20px 0 0',padding:'20px 20px 40px',width:'100%',maxWidth:500}} onClick={e=>e.stopPropagation()}>
+        <div style={{fontSize:15,fontWeight:800,color:'#1B2B5E',marginBottom:14}}>🛣️ Add Toll Charge</div>
+        <div style={{marginBottom:10}}><div style={{fontSize:11,fontWeight:600,color:'#64748B',marginBottom:4}}>Toll Date (actual date tolls occurred)</div>
+          <input type="date" value={date} onChange={e=>setDate(e.target.value)} style={{...S.input}}/></div>
+        <div style={{marginBottom:10}}><div style={{fontSize:11,fontWeight:600,color:'#64748B',marginBottom:4}}>Amount ($)</div>
+          <input type="number" value={amount} onChange={e=>setAmount(e.target.value)} placeholder="e.g. 3.50" step="0.01" style={{...S.input}}/></div>
+        <div style={{marginBottom:14}}><div style={{fontSize:11,fontWeight:600,color:'#64748B',marginBottom:4}}>Notes (optional)</div>
+          <input type="text" value={notes} onChange={e=>setNotes(e.target.value)} placeholder="e.g. SunPass — I-4 eastbound" style={{...S.input}}/></div>
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
+          <button onClick={onCancel} style={{...S.btnSm,background:'white',border:'1px solid #CBD5E1',color:'#475569'}}>Cancel</button>
+          <button onClick={save} style={{...S.btnSm,background:'linear-gradient(135deg,#1B2B5E,#2E4FAF)',color:'white',border:'none',fontWeight:700}}>+ Add Toll</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TrackerScreen({isTracking,elapsed,totalMiles,gpsStatus,sessionStart,onStart,onEnd,sessions,onDel,onMarkPaid,onManualEntry,tolls,onAddToll,onDelToll,timeOnlyMode,config,gapBridged=0,onBgGuide}){
+  const hr=getHourlyRate(config),mr=getMileRate(config);
+  const gc={idle:'#94A3B8',acquiring:'#F59E0B',locked:'#10B981',error:'#EF4444',timeonly:'#6D28D9',recovering:'#F59E0B'};
+  const gl={idle:'GPS Ready — tap Start',acquiring:'Acquiring GPS signal…',locked:'GPS Locked ✓',error:'GPS unavailable — using Time-Only mode',timeonly:'Time-Only Mode (no GPS)',recovering:'Session restored — re-acquiring GPS…'};
+  const[showManualMiles,setShowManualMiles]=useState(false);
+  const[manualMiles,setManualMiles]=useState('');
+  const[showManualEntry,setShowManualEntry]=useState(false);
+  const[showAddToll,setShowAddToll]=useState(false);
+  const[manualSaved,setManualSaved]=useState(false);
+  const notSecure=!isSecure();
+
+  const handleManualSave=(data)=>{
+    onManualEntry(data);
+    setShowManualEntry(false);
+    setManualSaved(true);
+    setTimeout(()=>setManualSaved(false),2500);
+  };
+
+  return(
+    <div style={{paddingBottom:90}}>
+      <div style={{background:'linear-gradient(135deg,#1B2B5E,#2E4FAF)',padding:'40px 20px 20px',color:'white'}}>
+        <div style={{fontSize:10,opacity:0.6,textTransform:'uppercase',letterSpacing:'0.08em'}}>GPS Time & Mileage</div>
+        <div style={{fontSize:24,fontWeight:900,letterSpacing:'-0.02em',marginTop:4}}>Session Tracker</div>
+      </div>
+      {notSecure&&!isTracking&&<div style={{background:'#F5F3FF',border:'1px solid #DDD6FE',padding:'10px 16px',margin:'14px 14px 0',borderRadius:10}}>
+        <div style={{fontSize:12,fontWeight:700,color:'#5B21B6',marginBottom:3}}>📍 No GPS — Time-Only Mode</div>
+        <div style={{fontSize:11,color:'#6D28D9',lineHeight:1.5}}>Running as local file. GPS requires HTTPS hosting. Timer tracks your hours accurately. You can enter mileage manually when you end your session.</div>
+      </div>}
+      {isTracking&&gpsStatus==='recovering'&&<div style={{background:'#FFFBEB',border:'1px solid #FDE68A',padding:'10px 16px',margin:'14px 14px 0',borderRadius:10,display:'flex',alignItems:'center',gap:8}}>
+        <span style={{fontSize:16}}>🔄</span>
+        <div><div style={{fontSize:12,fontWeight:700,color:'#92400E'}}>Session Restored</div><div style={{fontSize:11,color:'#B45309'}}>Bridging GPS gap — calculating miles from last known location…</div></div>
+      </div>}
+      {isTracking&&gapBridged>0&&gpsStatus!=='recovering'&&<div style={{background:'#ECFDF5',border:'1px solid #6EE7B7',padding:'10px 16px',margin:'14px 14px 0',borderRadius:10,display:'flex',alignItems:'center',gap:8}}>
+        <span style={{fontSize:16}}>📍</span>
+        <div><div style={{fontSize:12,fontWeight:700,color:'#065F46'}}>GPS Gap Bridged</div><div style={{fontSize:11,color:'#047857'}}>+{gapBridged.toFixed(2)} mi added for distance covered while app was closed.</div></div>
+      </div>}
+      {isTracking&&(gpsStatus==='error'||gpsStatus==='timeonly')&&<div style={{background:'#FFF7ED',border:'1px solid #FED7AA',padding:'10px 16px',margin:'14px 14px 0',borderRadius:10}}>
+        <div style={{fontSize:12,fontWeight:700,color:'#C2410C',marginBottom:2}}>📵 GPS interrupted? Phone call or Maps?</div>
+        <div style={{fontSize:11,color:'#9A3412',lineHeight:1.4}}>End this session, then use <strong>Log Manual Entry</strong> below to enter exact start/end times and odometer so nothing is lost.</div>
+      </div>}
+      <div style={{padding:'14px'}}>
+        {manualSaved&&<div style={{background:'#ECFDF5',border:'1px solid #6EE7B7',borderRadius:10,padding:'10px 14px',marginBottom:10,fontSize:12,fontWeight:700,color:'#065F46'}}>✅ Manual entry saved successfully.</div>}
+        <div style={S.card}>
+          <div style={{textAlign:'center',padding:'18px 0 22px'}}>
+            <div style={{fontSize:58,fontWeight:900,color:isTracking?'#1B2B5E':'#CBD5E1',fontVariantNumeric:'tabular-nums',letterSpacing:'-0.03em',lineHeight:1}}>{fmtT(elapsed)}</div>
+            <div style={{fontSize:11,color:'#94A3B8',marginTop:8,textTransform:'uppercase',letterSpacing:'0.06em'}}>Elapsed Time</div>
+          </div>
+          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:16}}>
+            <div style={{background:'#F8FAFC',borderRadius:10,padding:'14px',textAlign:'center'}}>
+              <div style={{fontSize:24,fontWeight:800,color:'#1B2B5E'}}>{totalMiles.toFixed(2)}</div>
+              <div style={{fontSize:10,color:'#94A3B8',marginTop:3,textTransform:'uppercase'}}>{timeOnlyMode?'Miles (manual)':'Miles (GPS)'}</div>
+            </div>
+            <div style={{background:'#F8FAFC',borderRadius:10,padding:'14px',textAlign:'center'}}>
+              <div style={{fontSize:24,fontWeight:800,color:'#059669'}}>{cur((elapsed/3600)*hr+totalMiles*mr)}</div>
+              <div style={{fontSize:10,color:'#94A3B8',marginTop:3,textTransform:'uppercase'}}>Est. Earn</div>
+            </div>
+          </div>
+          <div style={{display:'flex',alignItems:'center',gap:8,background:'#F8FAFC',borderRadius:8,padding:'10px 12px',marginBottom:16}}>
+            <div style={{width:9,height:9,borderRadius:'50%',background:gc[timeOnlyMode?'timeonly':gpsStatus],flexShrink:0}}/>
+            <div style={{fontSize:12,color:gc[timeOnlyMode?'timeonly':gpsStatus],fontWeight:500,flex:1}}>{gl[timeOnlyMode?'timeonly':gpsStatus]}</div>
+            {isTracking&&sessionStart&&<div style={{fontSize:11,color:'#94A3B8'}}>since {new Date(sessionStart).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'})}</div>}
+          </div>
+          {!isTracking?(
+            <div>
+              <button onClick={()=>onStart(false)} style={{...S.btnP,background:'linear-gradient(135deg,#059669,#047857)',boxShadow:'0 4px 16px rgba(5,150,105,0.35)',marginBottom:8}}>▶  Start Session {notSecure?'(Time-Only)':'(GPS)'}</button>
+              {!notSecure&&<button onClick={()=>onStart(true)} style={{...S.btnP,background:'linear-gradient(135deg,#6D28D9,#4C1D95)',fontSize:13}}>▶  Start Time-Only (no GPS)</button>}
+            </div>
+          ):(
+            <div>
+              <button onClick={onBgGuide} style={{...S.btnP,background:'linear-gradient(135deg,#0F172A,#1E3A5F)',boxShadow:'0 4px 16px rgba(15,23,42,0.35)',marginBottom:8,display:'flex',alignItems:'center',justifyContent:'center',gap:8}}>
+                <span style={{fontSize:16}}>📱</span>
+                <span>Move to Background</span>
+              </button>
+              {showManualMiles&&(
+                <div style={{background:'#F5F3FF',borderRadius:10,padding:'12px',marginBottom:10}}>
+                  <div style={{fontSize:12,color:'#5B21B6',fontWeight:600,marginBottom:8}}>Enter mileage (odometer or estimate):</div>
+                  <input type="number" value={manualMiles} onChange={e=>setManualMiles(e.target.value)} placeholder="e.g. 47.3" style={{...S.input,marginBottom:8}}/>
+                  <button onClick={()=>onEnd(parseFloat(manualMiles)||0)} style={{...S.btnP,background:'#DC2626',fontSize:13}}>■  End Session & Save</button>
+                </div>
+              )}
+              {!showManualMiles&&<button onClick={()=>timeOnlyMode?setShowManualMiles(true):onEnd(null)} style={{...S.btnP,background:'linear-gradient(135deg,#DC2626,#B91C1C)',boxShadow:'0 4px 16px rgba(220,38,38,0.35)'}}>■  End Session</button>}
+            </div>
+          )}
+          <div style={{fontSize:11,color:'#94A3B8',textAlign:'center',marginTop:8}}>${hr.toFixed(2)}/hr + ${mr.toFixed(4)}/mi (2026 IRS rate) · Wall-clock timer</div>
+        </div>
+
+        {/* Manual Entry & Toll Buttons */}
+        {!isTracking&&!showManualEntry&&(
+          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,marginBottom:12}}>
+            <button onClick={()=>setShowManualEntry(true)} style={{...S.btnSm,background:'linear-gradient(135deg,#D97706,#B45309)',color:'white',border:'none',fontWeight:700,display:'flex',alignItems:'center',justifyContent:'center',gap:6}}>
+              <span>📝</span><span>Log Manual Entry</span>
+            </button>
+            <button onClick={()=>setShowAddToll(true)} style={{...S.btnSm,background:'linear-gradient(135deg,#475569,#334155)',color:'white',border:'none',fontWeight:700,display:'flex',alignItems:'center',justifyContent:'center',gap:6}}>
+              <span>🛣️</span><span>Add Toll</span>
+            </button>
+          </div>
+        )}
+        {showManualEntry&&<ManualEntryForm onSave={handleManualSave} onCancel={()=>setShowManualEntry(false)} config={config}/>}
+
+        {/* Session History */}
+        {sessions.length>0&&(
+          <>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+              <div style={S.lbl}>Session History</div>
+              <button onClick={()=>exportSessionsCSV(sessions,config?.orgShort,hr)} style={{background:'none',border:'1px solid #CBD5E1',borderRadius:8,padding:'5px 10px',fontSize:11,color:'#475569',cursor:'pointer',fontFamily:'inherit'}}>⬇ Export CSV</button>
+            </div>
+            {[...sessions].reverse().map(s=>(
+              <div key={s.id} style={{background:'white',borderRadius:12,padding:'13px 14px',marginBottom:8,boxShadow:'0 1px 3px rgba(0,0,0,0.05)',display:'flex',alignItems:'center',gap:10,opacity:s.paid?0.55:1,border:s.paid?'1px solid #E2E8F0':'none'}}>
+                <div style={{flex:1}}>
+                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                    <span style={{fontSize:13,fontWeight:600,color:'#1E293B'}}>{s.date}{s.manual&&<span style={{marginLeft:6,fontSize:10,background:'#FEF3C7',color:'#92400E',borderRadius:4,padding:'1px 5px',fontWeight:700}}>MANUAL</span>}</span>
+                    <span style={{fontSize:13,fontWeight:700,color:s.paid?'#94A3B8':'#059669'}}>{s.paid?'✓ Paid':cur(s.totalSeconds/3600*hr+s.totalMiles*mr)}</span>
+                  </div>
+                  <div style={{fontSize:11,color:'#94A3B8',marginTop:3}}>{fmtT(s.totalSeconds)} · {s.totalMiles.toFixed(2)} mi{s.timeOnly?' (time-only)':''}{s.toll>0?` · toll ${cur(s.toll)}`:''}</div>
+                  {s.notes&&<div style={{fontSize:11,color:'#94A3B8',fontStyle:'italic',marginTop:2}}>{s.notes}</div>}
+                </div>
+                <div style={{display:'flex',flexDirection:'column',gap:4,alignItems:'center'}}>
+                  {!s.paid&&<button onClick={()=>onMarkPaid(s.id)} title="Mark Paid" style={{background:'none',border:'1px solid #BBF7D0',borderRadius:6,color:'#059669',cursor:'pointer',fontSize:11,padding:'3px 7px',fontFamily:'inherit',fontWeight:600}}>✓</button>}
+                  <button onClick={()=>onDel(s.id)} style={{background:'none',border:'none',color:'#FCA5A5',cursor:'pointer',fontSize:17,padding:4}}>✕</button>
+                </div>
+              </div>
+            ))}
+          </>
+        )}
+
+        {/* Toll History */}
+        {tolls&&tolls.length>0&&(
+          <>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8,marginTop:4}}>
+              <div style={S.lbl}>Toll Ledger</div>
+              <button onClick={()=>setShowAddToll(true)} style={{background:'none',border:'1px solid #CBD5E1',borderRadius:8,padding:'5px 10px',fontSize:11,color:'#475569',cursor:'pointer',fontFamily:'inherit'}}>+ Add</button>
+            </div>
+            {[...tolls].sort((a,b)=>b.date.localeCompare(a.date)).map(t=>(
+              <div key={t.id} style={{background:'white',borderRadius:10,padding:'11px 14px',marginBottom:6,boxShadow:'0 1px 3px rgba(0,0,0,0.05)',display:'flex',alignItems:'center',gap:10,opacity:t.paid?0.55:1}}>
+                <span style={{fontSize:18}}>🛣️</span>
+                <div style={{flex:1}}>
+                  <div style={{display:'flex',justifyContent:'space-between'}}><span style={{fontSize:13,fontWeight:600,color:'#1E293B'}}>{t.date}</span><span style={{fontSize:13,fontWeight:700,color:t.paid?'#94A3B8':'#1B2B5E'}}>{t.paid?'✓ Paid':cur(t.amount)}</span></div>
+                  {t.notes&&<div style={{fontSize:11,color:'#94A3B8',marginTop:2}}>{t.notes}</div>}
+                </div>
+                <button onClick={()=>onDelToll(t.id)} style={{background:'none',border:'none',color:'#FCA5A5',cursor:'pointer',fontSize:17,padding:4}}>✕</button>
+              </div>
+            ))}
+          </>
+        )}
+      </div>
+      {showAddToll&&<AddTollModal onSave={t=>{onAddToll(t);setShowAddToll(false);}} onCancel={()=>setShowAddToll(false)}/>}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════
+// DRUG ROW — reusable multi-drug editor row
+// ══════════════════════════════════════════════════════
+function DrugRow({drug,idx,onChange,onRemove,showRemove}){
+  return(
+    <div style={{background:'#F8FAFC',borderRadius:10,padding:'12px',marginBottom:8,border:'1px solid #E2E8F0'}}>
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+        <div style={{fontSize:12,fontWeight:700,color:'#1B2B5E'}}>Drug {idx+1}</div>
+        {showRemove&&<button onClick={onRemove} style={{background:'none',border:'none',color:'#EF4444',fontSize:12,cursor:'pointer',fontFamily:'inherit',fontWeight:600}}>Remove</button>}
+      </div>
+      <FR label="Drug Name & NDC" req>
+        <DrugSearch value={drug.drug?.name||''} ndc={drug.drug?.ndc} onChange={d=>onChange('drug',d)} onClear={()=>onChange('drug',null)}/>
+      </FR>
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:8,marginTop:4}}>
+        <FR label="Qty" req><TIn value={drug.qty} onChange={v=>onChange('qty',v)} placeholder="e.g. 2"/></FR>
+        <FR label="Lot # (opt)"><TIn value={drug.lot} onChange={v=>onChange('lot',v)} placeholder="Lot"/></FR>
+        <FR label="Exp Date (opt)"><TIn type="date" value={drug.expDate} onChange={v=>onChange('expDate',v)}/></FR>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════
+// COLD CHAIN SCREEN
+// Tabs: Planned Runs | ⏳ In Progress | Ad-Hoc | History
+// ══════════════════════════════════════════════════════
+function ColdChainScreen({logs,onSave,onUpdate,onDel,runs,config}){
+  const todayRuns=runs.filter(r=>r.date>=todayISO()).sort((a,b)=>a.date.localeCompare(b.date));
+  const pendingLogs=logs.filter(l=>l.status==='pending');
+  const completeLogs=logs.filter(l=>l.status==='complete');
+
+  const[view,setView]=useState('runs');
+  // Run execution state
+  const[selRun,setSelRun]=useState(null),[selStop,setSelStop]=useState(null);
+  const[phase,setPhase]=useState('pickup'),[form,setForm]=useState({});
+  const[sigKey,setSigKey]=useState(0),[runSaved,setRunSaved]=useState(false);
+  // Completing a pending log
+  const[completingLog,setCompletingLog]=useState(null);
+  const[compForm,setCompForm]=useState({arrTemp:'',excursion:'No',rcvdBy:'',deliverySig:null});
+  const[compSigKey,setCompSigKey]=useState(0);
+
+  const newBlankDrug=()=>({id:uid(),drug:null,qty:'',lot:'',expDate:''});
+  // Ad-hoc state
+  const blankAdhoc={origin:LOCS[0],dest:'',drugs:[newBlankDrug()],depTemp:'',pickupSig:null,notes:''};
+  const[adhoc,setAdhoc]=useState(blankAdhoc),[adhocSaved,setAdhocSaved]=useState(false),[adhocSigKey,setAdhocSigKey]=useState(0);
+
+  const setF=(k,v)=>setForm(p=>({...p,[k]:v}));
+  const setCF=(k,v)=>setCompForm(p=>({...p,[k]:v}));
+  const setA=(k,v)=>setAdhoc(p=>({...p,[k]:v}));
+  const setDrugField=(idx,field,val)=>setAdhoc(p=>({...p,drugs:p.drugs.map((d,i)=>i===idx?{...d,[field]:val}:d)}));
+  const removeDrug=idx=>setAdhoc(p=>({...p,drugs:p.drugs.filter((_,i)=>i!==idx)}));
+  const addDrug=()=>setAdhoc(p=>({...p,drugs:[...p.drugs,newBlankDrug()]}));
+
+  // Save pickup phase → pending log
+  const saveRunPickup=()=>{
+    if(!form.depTemp){alert('Enter departure temperature.');return;}
+    if(!form.dispStaffName){alert('Enter dispensing staff name.');return;}
+    if(!form.pickupSig){alert('Dispensing staff must sign before saving.');return;}
+    const log={id:uid(),status:'pending',type:'run',runId:selRun.id,runDate:selRun.date,stop:selStop,
+      origin:'Orange City (Main)',dest:selStop.location,drugs:selStop.drugs,
+      form:{...form},pickupTimestamp:Date.now(),completedTimestamp:null};
+    onSave(log);
+    setRunSaved(true);setTimeout(()=>{setRunSaved(false);setView('runs');setSelRun(null);setSelStop(null);},2000);
+  };
+  // Complete delivery (from In Progress)
+  const completeLog=()=>{
+    if(!compForm.arrTemp){alert('Enter arrival temperature.');return;}
+    if(!compForm.rcvdBy){alert('Enter receiver name.');return;}
+    if(!compForm.deliverySig){alert('Receiver must sign to complete.');return;}
+    onUpdate(completingLog.id,{...compForm,status:'complete',completedTimestamp:Date.now()});
+    setCompletingLog(null);setView('inprogress');
+  };
+
+  // Save ad-hoc as pending (pickup only)
+  const saveAdhocPickup=()=>{
+    if(!adhoc.dest){alert('Select a destination.');return;}
+    const invalidDrug=adhoc.drugs.find(d=>!d.drug||!d.qty);
+    if(invalidDrug){alert('Select a drug and enter quantity for each drug row.');return;}
+    if(!adhoc.depTemp){alert('Enter departure temperature.');return;}
+    if(!adhoc.dispStaffName){alert('Enter dispensing staff name.');return;}
+    if(!adhoc.pickupSig){alert('Dispensing staff must sign at pickup.');return;}
+    const log={id:uid(),status:'pending',type:'adhoc',origin:adhoc.origin,dest:adhoc.dest,
+      drugs:adhoc.drugs.map(d=>({name:d.drug.name,ndc:d.drug.ndc,mfr:d.drug.mfr,qty:d.qty,lot:d.lot,expDate:d.expDate})),
+      depTemp:adhoc.depTemp,dispStaffName:adhoc.dispStaffName,pickupSig:adhoc.pickupSig,notes:adhoc.notes,
+      pickupTimestamp:Date.now(),completedTimestamp:null};
+    onSave(log);
+    setAdhoc(blankAdhoc);setAdhocSaved(true);setAdhocSigKey(k=>k+1);
+    setTimeout(()=>{setAdhocSaved(false);setView('inprogress');},2000);
+  };
+
+  const startRunStop=(run,stop)=>{setSelRun(run);setSelStop(stop);setPhase('pickup');setForm({depTemp:'',pickupSig:null,lot:'',expDate:'',notes:''});setSigKey(k=>k+1);setView('execute');};
+  const openComplete=log=>{setCompletingLog(log);setCompForm({arrTemp:'',excursion:'No',rcvdBy:'',deliverySig:null});setCompSigKey(k=>k+1);setView('completing');};
+
+  const excursionWarning=ex=>ex==='Yes'&&(
+    <div style={{background:'#FEF2F2',border:'2px solid #FECACA',borderRadius:10,padding:'12px 14px',marginBottom:12,color:'#991B1B',fontSize:13,fontWeight:700}}>
+      ⚠️ TEMPERATURE EXCURSION — Notify {config?.orgName||'your organization'} immediately. Do NOT deliver without written authorization.
+    </div>
+  );
+
+  const tabCounts={runs:todayRuns.length,inprogress:pendingLogs.length,adhoc:null,history:completeLogs.length};
+  const tabLabels=[['runs',`Upcoming (${tabCounts.runs})`],['inprogress',pendingLogs.length>0?`⏳ Pending (${pendingLogs.length})`:'In Progress'],['adhoc','Ad-Hoc'],['history',`History (${completeLogs.length})`]];
+
+  return(
+    <div style={{paddingBottom:90}}>
+      <div style={{background:'linear-gradient(135deg,#0C4A6E,#0369A1)',padding:'40px 20px 16px',color:'white'}}>
+        <div style={{fontSize:10,opacity:0.6,textTransform:'uppercase',letterSpacing:'0.08em'}}>Pharmaceutical Transport</div>
+        <div style={{fontSize:24,fontWeight:900,letterSpacing:'-0.02em',marginTop:4}}>Cold Chain Log</div>
+        <div style={{display:'flex',gap:6,marginTop:14,flexWrap:'wrap'}}>
+          {tabLabels.map(([v,l])=>(
+            <button key={v} onClick={()=>{setView(v);setSelRun(null);setSelStop(null);setCompletingLog(null);}} style={{...S.pill(view===v||view==='execute'&&v==='runs'||view==='completing'&&v==='inprogress'),fontSize:11}}>{l}</button>
+          ))}
+        </div>
+      </div>
+
+      {/* ─── PLANNED RUNS ─── */}
+      {view==='runs'&&(
+        <div style={{padding:'14px'}}>
+          {todayRuns.length===0
+            ?<div style={{textAlign:'center',padding:'50px 20px',color:'#94A3B8'}}>
+                <div style={{fontSize:36,marginBottom:12}}>📦</div>
+                <div style={{fontSize:14,fontWeight:600,marginBottom:6}}>No upcoming runs</div>
+                <div style={{fontSize:12}}>Drug Manager can upload an Excel file or create runs manually.</div>
+                <button onClick={()=>setView('adhoc')} style={{marginTop:14,background:'#0369A1',border:'none',borderRadius:10,color:'white',fontSize:13,fontWeight:600,padding:'10px 20px',cursor:'pointer',fontFamily:'inherit'}}>Ad-Hoc Entry</button>
+              </div>
+            :<>
+              <div style={{background:'#F0F9FF',border:'1px solid #BAE6FD',borderRadius:10,padding:'11px 13px',marginBottom:12,fontSize:12,color:'#0369A1',lineHeight:1.5}}>
+                <strong>📋 Before leaving:</strong> Go to the <strong>Manifest tab</strong> to complete your departure checklist and get the dispensing staff signature.
+              </div>
+              {todayRuns.map(run=>{
+                const isToday=run.date===todayISO();
+                const isTomorrow=run.date===new Date(Date.now()+86400000).toISOString().slice(0,10);
+                const dateLabel=isToday?'TODAY':isTomorrow?'TOMORROW':new Date(run.date+'T12:00:00').toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'});
+                return(
+              <div key={run.id} style={{...S.card,opacity:isToday?1:0.85}}>
+                <div style={{...S.hdiv,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                  <span>Run: {new Date(run.date+'T12:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric'})}</span>
+                  <div style={{display:'flex',gap:6,alignItems:'center'}}>
+                    <span style={{fontSize:10,fontWeight:700,padding:'2px 8px',borderRadius:20,background:isToday?'#DCFCE7':isTomorrow?'#FEF3C7':'#F1F5F9',color:isToday?'#059669':isTomorrow?'#D97706':'#64748B'}}>{dateLabel}</span>
+                    <span style={{fontWeight:400,fontSize:12,color:'#94A3B8'}}>{run.stops.length} stop{run.stops.length!==1?'s':''}</span>
+                  </div>
+                </div>
+                {run.stops.map((stop,si)=>{
+                  const done=logs.some(l=>l.runId===run.id&&l.stop?.location===stop.location);
+                  const pending=logs.some(l=>l.runId===run.id&&l.stop?.location===stop.location&&l.status==='pending');
+                  return(
+                    <div key={si} style={{marginBottom:10,borderRadius:10,border:`1px solid ${done?(pending?'#FDE68A':'#86EFAC'):'#E2E8F0'}`,padding:'12px',background:done?(pending?'#FFFBEB':'#F0FDF4'):'#FAFBFF'}}>
+                      <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:6}}>
+                        <div>
+                          <div style={{fontSize:13,fontWeight:700,color:'#1E293B'}}>Stop {si+1}: {stop.location}</div>
+                          <div style={{fontSize:11,color:'#64748B',marginTop:2}}>{stop.drugs.length} drug{stop.drugs.length!==1?'s':''}</div>
+                        </div>
+                        {!done&&<button onClick={()=>startRunStop(run,stop)} style={{background:'#0369A1',border:'none',borderRadius:8,color:'white',fontSize:12,fontWeight:600,padding:'7px 14px',cursor:'pointer',fontFamily:'inherit'}}>Start →</button>}
+                        {pending&&<span style={{fontSize:11,fontWeight:700,color:'#D97706',background:'#FEF3C7',padding:'3px 8px',borderRadius:20}}>⏳ Pickup saved</span>}
+                        {done&&!pending&&<span style={{fontSize:11,fontWeight:700,color:'#059669',background:'#DCFCE7',padding:'3px 8px',borderRadius:20}}>✓ Complete</span>}
+                      </div>
+                      {stop.drugs.map((d,di)=>(
+                        <div key={di} style={{fontSize:12,color:'#475569',padding:'3px 0',borderTop:di>0?'1px solid #F1F5F9':'none'}}>
+                          <span style={{fontWeight:500}}>{d.name}</span>
+                          {d.ndc&&<span style={{fontFamily:'monospace',color:'#94A3B8',marginLeft:8,fontSize:11}}>{fmtNDC(d.ndc)}</span>}
+                          {d.qty&&<span style={{color:'#94A3B8',marginLeft:8}}>Qty: {d.qty}</span>}
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })}
+              </div>
+            );})}
+            </>
+          }
+        </div>
+      )}
+
+      {/* ─── RUN EXECUTE ─── */}
+      {view==='execute'&&selRun&&selStop&&(
+        <div style={{padding:'14px'}}>
+          {runSaved&&<div style={{background:'#ECFDF5',border:'1px solid #6EE7B7',borderRadius:10,padding:'12px 14px',marginBottom:12,color:'#065F46',fontSize:13,fontWeight:700}}>✓ Pickup saved for {selStop.location} — complete delivery when you arrive</div>}
+          <div style={{background:'#EFF6FF',border:'1px solid #BFDBFE',borderRadius:10,padding:'10px 14px',marginBottom:12}}>
+            <div style={{fontSize:11,fontWeight:700,color:'#1E40AF',textTransform:'uppercase',letterSpacing:'0.06em'}}>📦 Pickup Verification — Orange City</div>
+            <div style={{fontSize:12,color:'#1E40AF',marginTop:3}}>Destination: <strong>{selStop.location}</strong></div>
+          </div>
+          <div style={S.card}>
+            <div style={S.hdiv}>Drugs in This Stop</div>
+            {selStop.drugs.map((d,i)=>(
+              <div key={i} style={{padding:'8px 0',borderBottom:'1px solid #F1F5F9'}}><div style={{fontSize:13,fontWeight:600,color:'#1E293B'}}>{d.name}</div><div style={{fontSize:11,color:'#94A3B8',fontFamily:'monospace'}}>{fmtNDC(d.ndc)}{d.qty&&` · Qty: ${d.qty}`}</div></div>
+            ))}
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginTop:12}}>
+              <FR label="Lot # (opt)"><TIn value={form.lot||''} onChange={v=>setF('lot',v)} placeholder="Lot #"/></FR>
+              <FR label="Exp Date (opt)"><TIn type="date" value={form.expDate||''} onChange={v=>setF('expDate',v)}/></FR>
+            </div>
+          </div>
+          <div style={S.card}>
+            <div style={S.hdiv}>Departure Temp & Pickup Signature</div>
+            <FR label="Departure Temp (°F)" req><TIn type="number" value={form.depTemp||''} onChange={v=>setF('depTemp',v)} placeholder="e.g. 39.2"/></FR>
+            <FR label="Dispensing Staff (Print Name)" req><TIn value={form.dispStaffName||''} onChange={v=>setF('dispStaffName',v)} placeholder="Full name of dispensing staff"/></FR>
+            <FR label="Notes"><TIn value={form.notes||''} onChange={v=>setF('notes',v)} placeholder="Observations at pickup"/></FR>
+            <SigPad label="Dispensing Staff Signature — Orange City" onSave={sig=>setF('pickupSig',sig)} resetKey={sigKey}/>
+            <button onClick={saveRunPickup} style={{...S.btnP,marginTop:16,background:'linear-gradient(135deg,#0C4A6E,#0369A1)'}}>💾 Save Pickup — Complete at Destination</button>
+            <div style={{fontSize:11,color:'#94A3B8',textAlign:'center',marginTop:6}}>Saves as "Pending." Go to ⏳ In Progress tab to complete at {selStop.location}.</div>
+          </div>
+          <button onClick={()=>{setView('runs');setSelRun(null);setSelStop(null);}} style={{...S.btnSm,width:'100%',padding:'12px',textAlign:'center',marginTop:4}}>← Back to Runs</button>
+        </div>
+      )}
+
+      {/* ─── IN PROGRESS (pending) ─── */}
+      {view==='inprogress'&&(
+        <div style={{padding:'14px'}}>
+          {pendingLogs.length===0
+            ?<div style={{textAlign:'center',padding:'60px 20px',color:'#94A3B8'}}>
+                <div style={{fontSize:40,marginBottom:12}}>⏳</div>
+                <div style={{fontSize:14,fontWeight:600,marginBottom:6}}>No pending logs</div>
+                <div style={{fontSize:12}}>Pickup-saved logs appear here. Open at the destination to add arrival temp and receiver signature.</div>
+              </div>
+            :pendingLogs.map(l=>(
+              <div key={l.id} style={{background:'white',borderRadius:12,padding:'14px',marginBottom:10,boxShadow:'0 1px 4px rgba(0,0,0,0.07)',borderLeft:'4px solid #F59E0B'}}>
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:8}}>
+                  <div>
+                    <div style={{fontSize:14,fontWeight:700,color:'#1E293B'}}>{l.dest}</div>
+                    <div style={{fontSize:11,color:'#94A3B8',marginTop:2}}>Pickup: {fmtDT(l.pickupTimestamp)} · Dep: {l.form?.depTemp||l.depTemp}°F</div>
+                    <div style={{fontSize:11,color:'#94A3B8',marginTop:1}}>{(l.drugs||[]).length} drug{(l.drugs||[]).length!==1?'s':''}: {(l.drugs||[]).map(d=>d.name.split(' ')[0]).join(', ')}</div>
+                  </div>
+                  <span style={{fontSize:10,fontWeight:700,color:'#D97706',background:'#FEF3C7',padding:'3px 8px',borderRadius:20,whiteSpace:'nowrap'}}>⏳ Pickup Done</span>
+                </div>
+                <div style={{display:'flex',gap:8}}>
+                  <button onClick={()=>openComplete(l)} style={{flex:1,background:'#0369A1',border:'none',borderRadius:8,color:'white',fontSize:12,fontWeight:600,padding:'9px',cursor:'pointer',fontFamily:'inherit'}}>✏️ Complete at {l.dest.replace('Kissimmee — ','')}</button>
+                  <button onClick={()=>printDeliveryLog(l,config?.orgName)} style={{background:'#1B2B5E',border:'none',borderRadius:8,color:'white',fontSize:11,fontWeight:600,padding:'9px 10px',cursor:'pointer',fontFamily:'inherit'}}>🖨</button>
+                </div>
+              </div>
+            ))
+          }
+        </div>
+      )}
+
+      {/* ─── COMPLETING A PENDING LOG ─── */}
+      {view==='completing'&&completingLog&&(
+        <div style={{padding:'14px'}}>
+          {excursionWarning(compForm.excursion)}
+          <div style={{background:'#FFFBEB',border:'1px solid #FDE68A',borderRadius:10,padding:'10px 14px',marginBottom:12}}>
+            <div style={{fontSize:11,fontWeight:700,color:'#D97706',textTransform:'uppercase',letterSpacing:'0.06em'}}>🏥 Step 2: Delivery Verification</div>
+            <div style={{fontSize:12,color:'#92400E',marginTop:3}}>Delivering to: <strong>{completingLog.dest}</strong></div>
+          </div>
+          <div style={S.card}>
+            <div style={S.hdiv}>Drugs</div>
+            {(completingLog.drugs||[]).map((d,i)=>(
+              <div key={i} style={{padding:'7px 0',borderBottom:'1px solid #F1F5F9'}}><span style={{fontSize:13,fontWeight:600}}>{d.name}</span><span style={{fontSize:11,color:'#94A3B8',marginLeft:8,fontFamily:'monospace'}}>{fmtNDC(d.ndc)}</span>{d.qty&&<span style={{fontSize:11,color:'#94A3B8',marginLeft:8}}>Qty: {d.qty}</span>}</div>
+            ))}
+          </div>
+          <div style={S.card}>
+            <div style={S.hdiv}>Arrival Details</div>
+            <FR label="Arrival Temp (°F)" req><TIn type="number" value={compForm.arrTemp} onChange={v=>setCF('arrTemp',v)} placeholder="e.g. 40.1"/></FR>
+            <FR label="Excursion?">
+              <div style={{display:'flex',gap:8}}>
+                {['No','Yes'].map(v=>(
+                  <button key={v} onClick={()=>setCF('excursion',v)} style={{flex:1,padding:'11px',border:'1.5px solid',borderColor:compForm.excursion===v?(v==='Yes'?'#EF4444':'#10B981'):'#CBD5E1',borderRadius:8,background:compForm.excursion===v?(v==='Yes'?'#FEF2F2':'#F0FDF4'):'white',color:compForm.excursion===v?(v==='Yes'?'#DC2626':'#059669'):'#64748B',fontWeight:700,cursor:'pointer',fontFamily:'inherit',fontSize:14}}>
+                    {v==='No'?'✓ No':'⚠ Yes'}
+                  </button>
+                ))}
+              </div>
+            </FR>
+            <FR label="Received By (Print Name)" req><TIn value={compForm.rcvdBy} onChange={v=>setCF('rcvdBy',v)} placeholder="Receiving staff member name"/></FR>
+            <SigPad label={`Receiver Signature — ${completingLog.dest}`} onSave={sig=>setCF('deliverySig',sig)} resetKey={compSigKey}/>
+            <button onClick={completeLog} style={{...S.btnP,marginTop:16,background:'linear-gradient(135deg,#059669,#047857)'}}>✓ Complete & Save Delivery Log</button>
+          </div>
+          <button onClick={()=>{setView('inprogress');setCompletingLog(null);}} style={{...S.btnSm,width:'100%',padding:'12px',textAlign:'center',marginTop:4}}>← Back to In Progress</button>
+        </div>
+      )}
+
+      {/* ─── AD-HOC ─── */}
+      {view==='adhoc'&&(
+        <div style={{padding:'14px'}}>
+          {adhocSaved&&<div style={{background:'#FFFBEB',border:'1px solid #FDE68A',borderRadius:10,padding:'12px 14px',marginBottom:12,color:'#92400E',fontSize:13,fontWeight:600}}>✓ Pickup saved as Pending — go to ⏳ In Progress tab to complete at destination</div>}
+          <div style={{background:'#F0F9FF',border:'1px solid #BAE6FD',borderRadius:10,padding:'10px 14px',marginBottom:12}}>
+            <div style={{fontSize:12,color:'#0369A1',fontWeight:600}}>📋 Workflow: Fill out pickup info here → Dispatching staff signs → Save → Complete arrival at destination from ⏳ In Progress tab</div>
+          </div>
+          <div style={S.card}>
+            <div style={S.hdiv}>Route</div>
+            <FR label="Origin"><Sel value={adhoc.origin} onChange={v=>setA('origin',v)} options={LOCS}/></FR>
+            <FR label="Destination" req><Sel value={adhoc.dest} onChange={v=>setA('dest',v)} options={['',...LOCS.filter(l=>l!==adhoc.origin)]} ph="Select destination"/></FR>
+          </div>
+          <div style={S.card}>
+            <div style={S.hdiv}>Drugs <span style={{fontSize:11,fontWeight:400,color:'#94A3B8'}}>({adhoc.drugs.length} added)</span></div>
+            {adhoc.drugs.map((drug,idx)=>(
+              <DrugRow key={drug.id} drug={drug} idx={idx}
+                onChange={(field,val)=>setDrugField(idx,field,val)}
+                onRemove={()=>removeDrug(idx)}
+                showRemove={adhoc.drugs.length>1}/>
+            ))}
+            <button onClick={addDrug} style={{...S.btnSm,width:'100%',color:'#0369A1',borderColor:'#BAE6FD',background:'#F0F9FF',fontWeight:600,padding:'10px',marginTop:4}}>+ Add Another Drug</button>
+          </div>
+          <div style={S.card}>
+            <div style={S.hdiv}>Pickup Details</div>
+            <FR label="Departure Temp (°F)" req><TIn type="number" value={adhoc.depTemp} onChange={v=>setA('depTemp',v)} placeholder="e.g. 39.2"/></FR>
+            <FR label="Dispensing Staff (Print Name)" req><TIn value={adhoc.dispStaffName||''} onChange={v=>setA('dispStaffName',v)} placeholder="Full name of dispensing staff"/></FR>
+            <FR label="Notes"><TIn value={adhoc.notes} onChange={v=>setA('notes',v)} placeholder="Observations at pickup"/></FR>
+            <SigPad label="Dispensing Staff Signature — Orange City (Pickup)" onSave={sig=>setA('pickupSig',sig)} resetKey={adhocSigKey}/>
+            <button onClick={saveAdhocPickup} style={{...S.btnP,marginTop:16,background:'linear-gradient(135deg,#0C4A6E,#0369A1)'}}>💾 Save Pickup — Complete Delivery Later</button>
+          </div>
+        </div>
+      )}
+
+      {/* ─── HISTORY ─── */}
+      {view==='history'&&(
+        <div style={{padding:'14px'}}>
+          {completeLogs.length>0&&(
+            <div style={{display:'flex',gap:8,marginBottom:12}}>
+              <button onClick={()=>exportLogsCSV(completeLogs,config?.orgShort)} style={{flex:1,padding:'10px',background:'white',border:'1px solid #CBD5E1',borderRadius:10,fontSize:12,fontWeight:600,color:'#475569',cursor:'pointer',fontFamily:'inherit'}}>⬇ Export All CSV</button>
+              <button onClick={()=>exportLogsCSV(logs,config?.orgShort)} style={{flex:1,padding:'10px',background:'white',border:'1px solid #CBD5E1',borderRadius:10,fontSize:12,fontWeight:600,color:'#475569',cursor:'pointer',fontFamily:'inherit'}}>⬇ Export All (incl. pending)</button>
+            </div>
+          )}
+          {completeLogs.length===0
+            ?<div style={{textAlign:'center',padding:'60px 20px',color:'#94A3B8'}}><div style={{fontSize:40,marginBottom:12}}>🌡</div><div>No completed logs yet</div></div>
+            :[...completeLogs].reverse().map(l=>(
+              <div key={l.id} style={{background:'white',borderRadius:12,padding:'14px',marginBottom:10,boxShadow:'0 1px 3px rgba(0,0,0,0.05)',borderLeft:`3px solid ${(l.form?.excursion||l.excursion)==='Yes'?'#EF4444':'#0369A1'}`}}>
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start'}}>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{fontSize:13,fontWeight:700,color:'#1E293B'}}>{l.dest||l.stop?.location}</div>
+                    <div style={{fontSize:12,color:'#475569',marginTop:2}}>
+                      {(l.drugs||[]).map(d=><span key={d.ndc} style={{display:'inline-block',marginRight:8}}>{d.name.split(' ').slice(0,2).join(' ')}{d.qty?` ×${d.qty}`:''}</span>)}
+                    </div>
+                    <div style={{fontSize:12,color:'#475569',marginTop:2}}>Dep: {l.form?.depTemp||l.depTemp}°F · Arr: {l.form?.arrTemp||l.arrTemp}°F</div>
+                    {(l.form?.excursion||l.excursion)==='Yes'&&<div style={{fontSize:11,fontWeight:700,color:'#DC2626',marginTop:4}}>⚠ EXCURSION FLAGGED</div>}
+                    <div style={{fontSize:11,color:'#94A3B8',marginTop:4}}>{fmtDT(l.pickupTimestamp||l.timestamp)} · Rcvd: {l.form?.rcvdBy||l.rcvdBy}</div>
+                  </div>
+                  <div style={{display:'flex',flexDirection:'column',gap:6,flexShrink:0,marginLeft:8}}>
+                    <button onClick={()=>printDeliveryLog(l,config?.orgName)} style={{background:'#1B2B5E',border:'none',borderRadius:7,color:'white',fontSize:11,fontWeight:600,padding:'6px 10px',cursor:'pointer',fontFamily:'inherit'}}>🖨 Print</button>
+                    <button onClick={()=>onDel(l.id)} style={{background:'none',border:'1px solid #FECACA',borderRadius:7,color:'#EF4444',cursor:'pointer',fontSize:11,padding:'5px 10px',fontFamily:'inherit'}}>Delete</button>
+                  </div>
+                </div>
+              </div>
+            ))
+          }
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════
+// MANIFEST SCREEN — Build from Cold Chain Logs + Manual + History
+// ══════════════════════════════════════════════════════
+function ManifestScreen({manifests,onSave,onDel,coldChainLogs,config}){
+  const[view,setView]=useState('build');
+  const[sigKey,setSigKey]=useState(0);
+
+  // ── Build state ──────────────────────────────────
+  const[buildDate,setBuildDate]=useState(todayISO());
+  const[selectedLogIds,setSelectedLogIds]=useState({});
+  const[buildStaff,setBuildStaff]=useState('');
+  const[buildDispSig,setBuildDispSig]=useState(null);
+  const[buildCtrSig,setBuildCtrSig]=useState(null);
+  const[buildSaved,setBuildSaved]=useState(false);
+
+  // Logs for selected date
+  const logsForDate=coldChainLogs.filter(l=>{
+    const ts=l.pickupTimestamp||l.timestamp;
+    return ts&&new Date(ts).toISOString().slice(0,10)===buildDate;
+  }).sort((a,b)=>(a.pickupTimestamp||a.timestamp)-(b.pickupTimestamp||b.timestamp));
+
+  // Group by destination
+  const logsByDest={};
+  logsForDate.forEach(l=>{
+    const d=l.dest||l.stop?.location||'Unknown';
+    if(!logsByDest[d])logsByDest[d]=[];
+    logsByDest[d].push(l);
+  });
+
+  const selectedLogs=logsForDate.filter(l=>selectedLogIds[l.id]);
+  const toggleLog=id=>setSelectedLogIds(p=>({...p,[id]:!p[id]}));
+  const toggleAllForDest=dest=>{
+    const dl=logsByDest[dest]||[];
+    const allSel=dl.every(l=>selectedLogIds[l.id]);
+    const u={};dl.forEach(l=>{u[l.id]=!allSel;});
+    setSelectedLogIds(p=>({...p,...u}));
+  };
+  const selectAll=()=>{const u={};logsForDate.forEach(l=>{u[l.id]=true;});setSelectedLogIds(u);};
+  const clearAll=()=>setSelectedLogIds({});
+
+  // Build consolidated stops — computed once
+  const builtStops=(()=>{
+    const byDest={};
+    selectedLogs.forEach(l=>{
+      const dest=l.dest||l.stop?.location||'Unknown';
+      if(!byDest[dest])byDest[dest]={dest,drugs:[],depTemp:l.form?.depTemp||l.depTemp||'',arrTemp:l.form?.arrTemp||l.arrTemp||'',excursion:l.form?.excursion||'No'};
+      (l.drugs||l.stop?.drugs||[]).forEach(d=>{
+        byDest[dest].drugs.push({name:d.name,ndc:d.ndc,qty:d.qty,lot:d.lot||l.form?.lot||'',expDate:d.expDate||l.form?.expDate||''});
+      });
+    });
+    return Object.values(byDest);
+  })();
+
+  // Route — computed once
+  const routeStopKeys=[...new Set(builtStops.map(s=>s.dest))].filter(k=>LOC_DATA[k]);
+  const unknownStops=builtStops.map(s=>s.dest).filter(k=>!LOC_DATA[k]);
+  const routeResult=routeStopKeys.length>0?optimizeRoute('Orange City (Main)',routeStopKeys):null;
+  const orderedKeys=routeResult?.order||routeStopKeys;
+  const totalDrugsSelected=builtStops.reduce((a,s)=>a+s.drugs.length,0);
+
+  const saveCompiled=()=>{
+    if(selectedLogs.length===0){alert('Select at least one cold chain log.');return;}
+    if(!buildStaff){alert('Enter dispensing staff name.');return;}
+    onSave({id:uid(),type:'compiled',origin:'Orange City (Main)',date:buildDate,stops:builtStops,
+      dispStaff:buildStaff,dispSig:buildDispSig,ctrSig:buildCtrSig,
+      logIds:selectedLogs.map(l=>l.id),timestamp:Date.now()});
+    setBuildSaved(true);setSigKey(k=>k+1);setBuildDispSig(null);setBuildCtrSig(null);
+    setBuildStaff('');setSelectedLogIds({});
+    setTimeout(()=>setBuildSaved(false),3000);
+  };
+  const printCompiled=()=>{
+    if(selectedLogs.length===0){alert('Select at least one cold chain log to print.');return;}
+    printManifest({type:'compiled',origin:'Orange City (Main)',date:buildDate,stops:builtStops,
+      dispStaff:buildStaff,dispSig:buildDispSig,ctrSig:buildCtrSig,timestamp:Date.now()},config?.orgName);
+  };
+
+  // ── Manual checklist state ────────────────────────
+  const blank={origin:LOCS[0],dest:'',checks:{},dispStaff:'',dispSig:null,ctrSig:null};
+  const[f,setF]=useState(blank);
+  const[manSaved,setManSaved]=useState(false);
+  const[manSigKey,setManSigKey]=useState(0);
+  const set=(k,v)=>setF(p=>({...p,[k]:v}));
+  const toggle=i=>setF(p=>({...p,checks:{...p.checks,[i]:!p.checks[i]}}));
+  const cnt=Object.values(f.checks).filter(Boolean).length,allDone=cnt===CHECKLIST.length;
+  const submitManual=()=>{
+    if(!f.dest){alert('Select a destination.');return;}
+    if(!allDone){alert(`Complete all ${CHECKLIST.length} items.`);return;}
+    if(!f.dispStaff){alert('Enter dispensing staff name.');return;}
+    onSave({...f,type:'manual',timestamp:Date.now()});
+    setF(blank);setManSaved(true);setManSigKey(k=>k+1);
+    setTimeout(()=>setManSaved(false),3000);
+  };
+
+  return(
+    <div style={{paddingBottom:90}}>
+      <div style={{background:'linear-gradient(135deg,#4C1D95,#6D28D9)',padding:'40px 20px 16px',color:'white'}}>
+        <div style={{fontSize:10,opacity:0.6,textTransform:'uppercase',letterSpacing:'0.08em'}}>Chain of Custody</div>
+        <div style={{fontSize:24,fontWeight:900,letterSpacing:'-0.02em',marginTop:4}}>Delivery Manifest</div>
+        <div style={{display:'flex',gap:6,marginTop:14,flexWrap:'wrap'}}>
+          {[['build','Build from Logs'],['manual','Manual Checklist'],['history',`History (${manifests.length})`]].map(([v,l])=>(
+            <button key={v} onClick={()=>setView(v)} style={{...S.pill(view===v),fontSize:11}}>{l}</button>
+          ))}
+        </div>
+      </div>
+
+      {/* ─── BUILD FROM LOGS ─── */}
+      {view==='build'&&(
+        <div style={{padding:'14px'}}>
+          {buildSaved&&<div style={{background:'#F5F3FF',border:'1px solid #DDD6FE',borderRadius:10,padding:'12px 14px',marginBottom:12,color:'#5B21B6',fontSize:13,fontWeight:600}}>✓ Manifest saved to History</div>}
+
+          <div style={S.card}>
+            <div style={S.hdiv}>Select Delivery Date</div>
+            <input type="date" value={buildDate} onChange={e=>{setBuildDate(e.target.value);setSelectedLogIds({});}} style={{...S.input,marginBottom:0}}/>
+          </div>
+
+          <div style={S.card}>
+            <div style={{...S.hdiv,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+              <span>Logs for {new Date(buildDate+'T12:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'})}</span>
+              {logsForDate.length>0&&(
+                <div style={{display:'flex',gap:6}}>
+                  <button onClick={selectAll} style={{fontSize:10,padding:'3px 8px',border:'1px solid #CBD5E1',borderRadius:6,background:'white',cursor:'pointer',fontFamily:'inherit',color:'#475569'}}>All</button>
+                  <button onClick={clearAll} style={{fontSize:10,padding:'3px 8px',border:'1px solid #CBD5E1',borderRadius:6,background:'white',cursor:'pointer',fontFamily:'inherit',color:'#475569'}}>None</button>
+                </div>
+              )}
+            </div>
+
+            {logsForDate.length===0
+              ?<div style={{textAlign:'center',padding:'30px 16px',color:'#94A3B8'}}>
+                  <div style={{fontSize:28,marginBottom:8}}>📭</div>
+                  <div style={{fontSize:13,fontWeight:600,marginBottom:4}}>No cold chain logs for this date</div>
+                  <div style={{fontSize:12}}>Complete cold chain pickups first, or select a different date.</div>
+                </div>
+              :Object.entries(logsByDest).map(([dest,destLogs])=>{
+                const allSel=destLogs.every(l=>selectedLogIds[l.id]);
+                const someSel=destLogs.some(l=>selectedLogIds[l.id]);
+                const totalDestDrugs=destLogs.reduce((a,l)=>(l.drugs||l.stop?.drugs||[]).length+a,0);
+                return(
+                  <div key={dest} style={{marginBottom:10,borderRadius:10,border:`2px solid ${allSel?'#7C3AED':someSel?'#C4B5FD':'#E2E8F0'}`,overflow:'hidden'}}>
+                    <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'9px 12px',background:allSel?'#F5F3FF':someSel?'#FAF5FF':'#F8FAFC',borderBottom:`1px solid ${allSel?'#C4B5FD':'#E2E8F0'}`}}>
+                      <div>
+                        <div style={{fontSize:13,fontWeight:700,color:'#1E293B'}}>{dest}</div>
+                        <div style={{fontSize:11,color:'#64748B'}}>{destLogs.length} log{destLogs.length!==1?'s':''} · {totalDestDrugs} drug{totalDestDrugs!==1?'s':''}</div>
+                      </div>
+                      <button onClick={()=>toggleAllForDest(dest)} style={{fontSize:11,padding:'4px 10px',border:`1px solid ${allSel?'#7C3AED':'#CBD5E1'}`,borderRadius:20,background:allSel?'#7C3AED':'white',color:allSel?'white':'#475569',cursor:'pointer',fontFamily:'inherit',fontWeight:600,flexShrink:0}}>
+                        {allSel?'✓ Selected':'Select All'}
+                      </button>
+                    </div>
+                    {destLogs.map(l=>{
+                      const sel=!!selectedLogIds[l.id];
+                      const drugs=l.drugs||l.stop?.drugs||[];
+                      const isPending=l.status==='pending';
+                      return(
+                        <div key={l.id} onClick={()=>toggleLog(l.id)} style={{display:'flex',alignItems:'flex-start',gap:10,padding:'10px 12px',background:sel?'#FAFAFF':'white',cursor:'pointer',borderBottom:'1px solid #F1F5F9'}}>
+                          <div style={{width:20,height:20,borderRadius:5,border:`2px solid ${sel?'#7C3AED':'#CBD5E1'}`,background:sel?'#7C3AED':'transparent',display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0,marginTop:1}}>
+                            {sel&&<span style={{color:'white',fontSize:11,fontWeight:900}}>✓</span>}
+                          </div>
+                          <div style={{flex:1,minWidth:0}}>
+                            <div style={{display:'flex',gap:6,alignItems:'center',flexWrap:'wrap',marginBottom:3}}>
+                              <span style={{fontSize:10,fontWeight:700,padding:'2px 7px',borderRadius:20,background:isPending?'#FEF3C7':'#DCFCE7',color:isPending?'#D97706':'#059669'}}>
+                                {isPending?'⏳ Pickup Only':'✓ Complete'}
+                              </span>
+                              <span style={{fontSize:11,color:'#64748B'}}>{fmtDT(l.pickupTimestamp||l.timestamp)}</span>
+                            </div>
+                            <div style={{fontSize:12,color:'#475569',lineHeight:1.4}}>
+                              {drugs.map((d,i)=>(
+                                <span key={i} style={{display:'inline-block',marginRight:10,marginBottom:2}}>
+                                  <span style={{fontWeight:500}}>{d.name?.split(' ').slice(0,3).join(' ')}</span>
+                                  {d.qty&&<span style={{color:'#94A3B8'}}> ×{d.qty}</span>}
+                                </span>
+                              ))}
+                            </div>
+                            {(l.form?.depTemp||l.depTemp)&&<div style={{fontSize:11,color:'#94A3B8',marginTop:2}}>Dep: {l.form?.depTemp||l.depTemp}°F{(l.form?.arrTemp||l.arrTemp)?` · Arr: ${l.form?.arrTemp||l.arrTemp}°F`:' · Delivery pending'}</div>}
+                            {(l.form?.dispStaffName||l.dispStaffName)&&<div style={{fontSize:11,color:'#94A3B8'}}>Staff: {l.form?.dispStaffName||l.dispStaffName}</div>}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })
+            }
+
+            {selectedLogs.length>0&&(
+              <div style={{marginTop:10,padding:'10px 12px',background:'#EFF6FF',borderRadius:9,border:'1px solid #BFDBFE'}}>
+                <div style={{fontSize:12,fontWeight:700,color:'#1E40AF'}}>
+                  ✓ {selectedLogs.length} log{selectedLogs.length!==1?'s':''} selected — {builtStops.length} stop{builtStops.length!==1?'s':''}, {totalDrugsSelected} drug{totalDrugsSelected!==1?'s':''} total
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* ── ROUTE OPTIMIZER ── */}
+          {selectedLogs.length>0&&routeStopKeys.length>0&&(
+            <div style={{...S.card,borderLeft:'3px solid #059669'}}>
+              <div style={{...S.hdiv,color:'#065F46'}}>🗺 Optimized Delivery Route</div>
+              <div style={{display:'flex',alignItems:'flex-start',gap:10,marginBottom:6}}>
+                <div style={{width:24,height:24,borderRadius:12,background:'#059669',color:'white',fontSize:13,display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0}}>🏠</div>
+                <div style={{flex:1,paddingTop:2}}>
+                  <div style={{fontSize:12,fontWeight:700,color:'#1E293B'}}>Orange City — Origin</div>
+                  <div style={{fontSize:11,color:'#64748B'}}>{LOC_DATA['Orange City (Main)'].addr}</div>
+                </div>
+              </div>
+              <div style={{marginLeft:11,width:2,height:8,background:'#D1FAE5',marginBottom:4}}/>
+              {orderedKeys.map((key,i)=>{
+                const loc=LOC_DATA[key];
+                const prev=i===0?LOC_DATA['Orange City (Main)']:LOC_DATA[orderedKeys[i-1]];
+                const legMi=loc&&prev?haversineMi(prev,loc):null;
+                return(
+                  <React.Fragment key={key}>
+                    <div style={{display:'flex',alignItems:'flex-start',gap:10,marginBottom:6}}>
+                      <div style={{width:24,height:24,borderRadius:12,background:'#4C1D95',color:'white',fontSize:12,fontWeight:900,display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0}}>{i+1}</div>
+                      <div style={{flex:1,paddingTop:2}}>
+                        <div style={{fontSize:12,fontWeight:700,color:'#1E293B'}}>{key}</div>
+                        {loc&&<div style={{fontSize:11,color:'#64748B'}}>{loc.addr}</div>}
+                        {legMi&&<div style={{fontSize:11,color:'#059669',fontWeight:600,marginTop:1}}>~{legMi.toFixed(1)} mi from {i===0?'origin':'previous stop'}</div>}
+                      </div>
+                    </div>
+                    {i<orderedKeys.length-1&&<div style={{marginLeft:11,width:2,height:8,background:'#D1FAE5',marginBottom:4}}/>}
+                  </React.Fragment>
+                );
+              })}
+              {unknownStops.length>0&&(
+                <div style={{marginTop:6,fontSize:11,color:'#D97706',background:'#FEF3C7',padding:'6px 10px',borderRadius:7}}>
+                  ⚠️ No coordinates for: {unknownStops.join(', ')}
+                </div>
+              )}
+              {routeResult&&routeResult.totalMi!=null&&(
+                <div style={{fontSize:11,color:'#64748B',margin:'10px 0',padding:'7px 10px',background:'#F0FDF4',borderRadius:7,border:'1px solid #BBF7D0'}}>
+                  📏 ~{routeResult.totalMi.toFixed(1)} miles total (straight-line)
+                </div>
+              )}
+              <button onClick={()=>openInMaps('Orange City (Main)',orderedKeys)} style={{width:'100%',padding:'13px',background:'linear-gradient(135deg,#059669,#047857)',color:'white',border:'none',borderRadius:10,fontSize:13,fontWeight:700,cursor:'pointer',fontFamily:'inherit'}}>
+                📍 Open in Google Maps
+              </button>
+              <div style={{fontSize:11,color:'#94A3B8',textAlign:'center',marginTop:6}}>Opens Maps with all stops in optimal order</div>
+            </div>
+          )}
+
+          {logsForDate.length>0&&(
+            <div style={S.card}>
+              <div style={S.hdiv}>Dispensing Staff & Signatures</div>
+              <FR label="Dispensing Staff (Print Name)" req>
+                <TIn value={buildStaff} onChange={v=>setBuildStaff(v)} placeholder="Staff member full name"/>
+              </FR>
+              <SigPad label="Dispensing Staff Signature" onSave={sig=>setBuildDispSig(sig)} resetKey={sigKey}/>
+              <div style={{marginTop:14}}>
+                <SigPad label="Driver / Contractor Signature" onSave={sig=>setBuildCtrSig(sig)} resetKey={sigKey}/>
+              </div>
+              <div style={{display:'flex',gap:8,marginTop:16}}>
+                <button onClick={printCompiled} style={{flex:1,padding:'13px',background:selectedLogs.length>0?'#4C1D95':'#E2E8F0',color:selectedLogs.length>0?'white':'#94A3B8',border:'none',borderRadius:10,fontSize:13,fontWeight:700,cursor:selectedLogs.length>0?'pointer':'default',fontFamily:'inherit'}}>
+                  🖨 Print Manifest
+                </button>
+                <button onClick={saveCompiled} style={{flex:1,padding:'13px',background:selectedLogs.length>0?'linear-gradient(135deg,#4C1D95,#6D28D9)':'#E2E8F0',color:selectedLogs.length>0?'white':'#94A3B8',border:'none',borderRadius:10,fontSize:13,fontWeight:700,cursor:selectedLogs.length>0?'pointer':'default',fontFamily:'inherit'}}>
+                  💾 Save & Print
+                </button>
+              </div>
+              <div style={{fontSize:11,color:'#94A3B8',textAlign:'center',marginTop:8}}>Print-only doesn't save to History. Save & Print does both.</div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ─── MANUAL CHECKLIST ─── */}
+      {view==='manual'&&(
+        <div style={{padding:'14px'}}>
+          {manSaved&&<div style={{background:'#F5F3FF',border:'1px solid #DDD6FE',borderRadius:10,padding:'12px 14px',marginBottom:12,color:'#5B21B6',fontSize:13,fontWeight:600}}>✓ Manifest saved</div>}
+          <div style={{background:'#FEF3C7',border:'1px solid #FDE68A',borderRadius:9,padding:'10px 13px',marginBottom:12,fontSize:12,color:'#92400E',lineHeight:1.5}}>
+            ℹ️ Use <strong>Build from Logs</strong> to auto-compile from cold chain logs. This tab is for standalone departure checklists.
+          </div>
+          <div style={S.card}>
+            <div style={S.hdiv}>Route</div>
+            <FR label="From"><Sel value={f.origin} onChange={v=>set('origin',v)} options={LOCS}/></FR>
+            <FR label="Destination" req><Sel value={f.dest} onChange={v=>set('dest',v)} options={['',...LOCS.filter(l=>l!==f.origin)]} ph="Select destination"/></FR>
+          </div>
+          <div style={S.card}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',...S.hdiv}}>
+              <span>Departure Checklist</span>
+              <span style={{fontWeight:600,fontSize:13,color:allDone?'#059669':'#F59E0B'}}>{cnt}/{CHECKLIST.length}</span>
+            </div>
+            {CHECKLIST.map((item,i)=>(
+              <div key={i} onClick={()=>toggle(i)} style={{display:'flex',alignItems:'flex-start',gap:10,padding:'11px 12px',borderRadius:9,background:f.checks[i]?'#F5F3FF':'#F8FAFC',cursor:'pointer',border:`1px solid ${f.checks[i]?'#C4B5FD':'#E2E8F0'}`,marginBottom:7}}>
+                <div style={{width:20,height:20,borderRadius:5,border:`2px solid ${f.checks[i]?'#7C3AED':'#CBD5E1'}`,background:f.checks[i]?'#7C3AED':'transparent',display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0,marginTop:1}}>
+                  {f.checks[i]&&<span style={{color:'white',fontSize:11,fontWeight:900}}>✓</span>}
+                </div>
+                <div style={{fontSize:12,color:f.checks[i]?'#5B21B6':'#475569',lineHeight:1.5,fontWeight:f.checks[i]?500:400}}>{item}</div>
+              </div>
+            ))}
+          </div>
+          <div style={S.card}>
+            <div style={S.hdiv}>Signatures</div>
+            <FR label="Dispensing Staff (Print Name)" req><TIn value={f.dispStaff} onChange={v=>set('dispStaff',v)} placeholder="Staff member full name"/></FR>
+            <SigPad label="Dispensing Staff Signature" onSave={sig=>set('dispSig',sig)} resetKey={manSigKey}/>
+            <div style={{marginTop:14}}><SigPad label="Driver / Contractor Signature" onSave={sig=>set('ctrSig',sig)} resetKey={manSigKey}/></div>
+            <button onClick={submitManual} style={{...S.btnP,marginTop:16,background:allDone?'linear-gradient(135deg,#4C1D95,#6D28D9)':'#E2E8F0',color:allDone?'white':'#94A3B8',cursor:allDone?'pointer':'default'}}>
+              {allDone?'Save Delivery Manifest':`Complete all ${CHECKLIST.length} items to save`}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ─── HISTORY ─── */}
+      {view==='history'&&(
+        <div style={{padding:'14px'}}>
+          {manifests.length>0&&(
+            <button onClick={()=>exportManifestsCSV(manifests,config?.orgShort)} style={{width:'100%',padding:'10px',background:'white',border:'1px solid #CBD5E1',borderRadius:10,fontSize:12,fontWeight:600,color:'#475569',cursor:'pointer',fontFamily:'inherit',marginBottom:12}}>
+              ⬇ Export All CSV
+            </button>
+          )}
+          {manifests.length===0
+            ?<div style={{textAlign:'center',padding:'60px 20px',color:'#94A3B8'}}>
+                <div style={{fontSize:40,marginBottom:12}}>📋</div>
+                <div>No manifests saved yet</div>
+              </div>
+            :[...manifests].reverse().map(m=>{
+              const isCompiled=m.type==='compiled';
+              const mTotalDrugs=isCompiled?(m.stops||[]).reduce((a,s)=>a+(s.drugs||[]).length,0):null;
+              return(
+                <div key={m.id} style={{background:'white',borderRadius:12,padding:'14px',marginBottom:10,boxShadow:'0 1px 3px rgba(0,0,0,0.05)',borderLeft:`3px solid ${isCompiled?'#0369A1':'#7C3AED'}`}}>
+                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start'}}>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{display:'flex',gap:6,alignItems:'center',marginBottom:4,flexWrap:'wrap'}}>
+                        <span style={{fontSize:10,fontWeight:700,padding:'2px 8px',borderRadius:20,background:isCompiled?'#EFF6FF':'#F5F3FF',color:isCompiled?'#1E40AF':'#5B21B6'}}>
+                          {isCompiled?'📦 Compiled':'📋 Manual'}
+                        </span>
+                      </div>
+                      <div style={{fontSize:13,fontWeight:700,color:'#1E293B'}}>
+                        {isCompiled?`${m.origin||'Orange City'} → ${(m.stops||[]).length} stop${(m.stops||[]).length!==1?'s':''}`:`${m.origin} → ${m.dest}`}
+                      </div>
+                      <div style={{fontSize:12,color:'#475569',marginTop:2}}>{fmtDT(m.timestamp)}</div>
+                      {isCompiled&&<div style={{fontSize:12,color:'#475569',marginTop:1}}>{mTotalDrugs} drug{mTotalDrugs!==1?'s':''} · {m.dispStaff||'—'}</div>}
+                      {!isCompiled&&<div style={{fontSize:11,color:'#7C3AED',marginTop:3,fontWeight:600}}>{Object.values(m.checks||{}).filter(Boolean).length}/{CHECKLIST.length} verified ✓</div>}
+                    </div>
+                    <div style={{display:'flex',flexDirection:'column',gap:6,flexShrink:0,marginLeft:8}}>
+                      <button onClick={()=>printManifest(m,config?.orgName)} style={{background:'#4C1D95',border:'none',borderRadius:7,color:'white',fontSize:11,fontWeight:600,padding:'6px 10px',cursor:'pointer',fontFamily:'inherit'}}>🖨 Print</button>
+                      <button onClick={()=>onDel(m.id)} style={{background:'none',border:'1px solid #FECACA',borderRadius:7,color:'#EF4444',cursor:'pointer',fontSize:11,padding:'5px 10px',fontFamily:'inherit'}}>Delete</button>
+                    </div>
+                  </div>
+                  {isCompiled&&(m.stops||[]).map((s,i)=>(
+                    <div key={i} style={{marginTop:6,padding:'7px 10px',background:'#F8FAFC',borderRadius:7,fontSize:11,color:'#475569'}}>
+                      <span style={{fontWeight:600,color:'#1E293B'}}>Stop {i+1}: {s.dest||s.location}</span>
+                      {' — '}{(s.drugs||[]).map(d=>d.name?.split(' ').slice(0,2).join(' ')).join(', ')}
+                    </div>
+                  ))}
+                </div>
+              );
+            })
+          }
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// ══════════════════════════════════════════════════════
+// INVOICE SCREEN
+// ══════════════════════════════════════════════════════
+function InvoiceScreen({sessions,coldChainLogs,manifests,config,tolls=[],onMarkSessionsPaid,onMarkTollsPaid,onUpdateConfig,onAddToll}){
+  const hr=getHourlyRate(config),mr=getMileRate(config);
+  const[name,setName]=useState('');
+  const[showRateEdit,setShowRateEdit]=useState(false);
+  const[editHr,setEditHr]=useState(String(hr));
+  const[showAddToll,setShowAddToll]=useState(false);
+  const[markedPaid,setMarkedPaid]=useState(false);
+  const bw=()=>{const n=new Date(),d=n.getDate(),y=n.getFullYear(),m=n.getMonth();return d<=15?{start:new Date(y,m,1).getTime(),end:new Date(y,m,15,23,59,59).getTime()}:{start:new Date(y,m,16).getTime(),end:new Date(y,m+1,0,23,59,59).getTime();};};
+  const[period,setPeriod]=useState(bw);
+  const prev=()=>setPeriod(p=>{const s=new Date(p.start);if(s.getDate()===1){const pm=new Date(s.getFullYear(),s.getMonth()-1);return{start:new Date(pm.getFullYear(),pm.getMonth(),16).getTime(),end:new Date(s.getFullYear(),s.getMonth(),0,23,59,59).getTime()};}return{start:new Date(s.getFullYear(),s.getMonth(),1).getTime(),end:new Date(s.getFullYear(),s.getMonth(),15,23,59,59).getTime()};});
+  const next=()=>setPeriod(p=>{const e=new Date(p.end);if(e.getDate()===15)return{start:new Date(e.getFullYear(),e.getMonth(),16).getTime(),end:new Date(e.getFullYear(),e.getMonth()+1,0,23,59,59).getTime()};const nm=new Date(e.getFullYear(),e.getMonth()+1);return{start:nm.getTime(),end:new Date(nm.getFullYear(),nm.getMonth(),15,23,59,59).getTime()};});
+  const ps=sessions.filter(s=>!s.paid&&s.startTime>=period.start&&s.startTime<=period.end);
+  const totHrs=ps.reduce((a,s)=>a+s.totalSeconds,0)/3600,totMi=ps.reduce((a,s)=>a+s.totalMiles,0);
+  const pStart=new Date(period.start).toISOString().slice(0,10);
+  const pEnd=new Date(period.end).toISOString().slice(0,10);
+  const sessionTolls=ps.reduce((a,s)=>a+(s.toll||0),0);
+  const periodTolls=tolls.filter(t=>!t.paid&&t.date>=pStart&&t.date<=pEnd);
+  const standaloneTolls=periodTolls.reduce((a,t)=>a+t.amount,0);
+  const totTolls=sessionTolls+standaloneTolls;
+  const hPay=totHrs*hr,mPay=totMi*mr,total=hPay+mPay+totTolls;
+  const pc=coldChainLogs.filter(l=>l.status==='complete'&&(l.pickupTimestamp||l.timestamp)>=period.start&&(l.pickupTimestamp||l.timestamp)<=period.end);
+  const pm=manifests.filter(m=>m.timestamp>=period.start&&m.timestamp<=period.end);
+  const billingEmail=config?.billingEmail||'billing@yourorg.com';
+  const orgName=config?.orgName||'Your Organization';
+  const saveRateEdit=()=>{const v=parseFloat(editHr);if(isNaN(v)||v<=0){alert('Enter a valid hourly rate.');return;}onUpdateConfig({...config,hourlyRate:v});setShowRateEdit(false);};
+  const send=()=>{
+    const tollLines=periodTolls.length>0?'\nTolls by Date:\n'+periodTolls.map(t=>`  ${t.date} | $${t.amount.toFixed(2)}${t.notes?` (${t.notes})`:''}`).join('\n'):'';
+    const subj=encodeURIComponent(`Invoice - ${name||'[Contractor]'} - ${fmtD(period.start)} to ${fmtD(period.end)}`);
+    const body=encodeURIComponent(`====================================================\n  INVOICE - ${orgName.toUpperCase()}\n  Powered by RxRunner\n====================================================\nContractor:    ${name||'[Full Legal Name]'}\nPay Period:    ${fmtD(period.start)} to ${fmtD(period.end)}\nSubmitted:     ${fmtDT(Date.now())}\n====================================================\nHours:    ${totHrs.toFixed(2)} hrs x $${hr.toFixed(2)}/hr = ${cur(hPay)}\nMileage:  ${totMi.toFixed(2)} mi x $${mr}/mi = ${cur(mPay)}\nTolls:    ${cur(totTolls)}\n----------------------------------------------------\nTOTAL DUE:    ${cur(total)}\n====================================================\nSESSIONS (${ps.length}):\n${ps.map(s=>`  ${s.date} | ${fmtT(s.totalSeconds)} | ${s.totalMiles.toFixed(2)} mi${s.toll>0?` | toll $${(s.toll||0).toFixed(2)}`:''} | ${cur(s.totalSeconds/3600*hr+s.totalMiles*mr+(s.toll||0))}${s.manual?' [MANUAL]':''}`).join('\n')||'  (none)'}${tollLines}\n\nCold Chain Logs (complete): ${pc.length}\nDelivery Manifests: ${pm.length}\nPayment Method:     ACH Direct Deposit\n====================================================`);
+    window.open(`mailto:${billingEmail}?subject=${subj}&body=${body}`,'_blank');
+  };
+  const markPaid=()=>{onMarkSessionsPaid(ps.map(s=>s.id));onMarkTollsPaid(periodTolls.map(t=>t.id));setMarkedPaid(true);setTimeout(()=>setMarkedPaid(false),3000);};
+  return(
+    <div style={{paddingBottom:90}}>
+      <div style={{background:'linear-gradient(135deg,#064E3B,#059669)',padding:'40px 20px 20px',color:'white'}}>
+        <div style={{fontSize:10,opacity:0.6,textTransform:'uppercase',letterSpacing:'0.08em'}}>Pay Period Report</div>
+        <div style={{fontSize:24,fontWeight:900,letterSpacing:'-0.02em',marginTop:4}}>Invoice Generator</div>
+      </div>
+      <div style={{padding:'14px'}}>
+        {markedPaid&&<div style={{background:'#ECFDF5',border:'1px solid #6EE7B7',borderRadius:10,padding:'12px 14px',marginBottom:10,fontSize:13,fontWeight:700,color:'#065F46'}}>All sessions and tolls in this period marked as paid.</div>}
+        <div style={S.card}><FR label="Your Full Name"><TIn value={name} onChange={setName} placeholder="Full legal name"/></FR></div>
+        <div style={S.card}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+            <div style={{fontSize:12,fontWeight:600,color:'#475569'}}>Pay Period <span style={{fontSize:10,color:'#94A3B8',fontWeight:400}}>(unpaid only)</span></div>
+          </div>
+          <div style={{display:'flex',alignItems:'center',gap:8}}>
+            <button onClick={prev} style={{...S.btnSm,flex:'none',width:38,padding:'9px',fontSize:18,textAlign:'center'}}>&#8249;</button>
+            <div style={{flex:1,textAlign:'center',background:'#F8FAFC',borderRadius:10,padding:'11px 8px'}}>
+              <div style={{fontSize:13,fontWeight:700,color:'#1E293B'}}>{fmtD(period.start)} to {fmtD(period.end)}</div>
+              <div style={{fontSize:11,color:'#94A3B8',marginTop:2}}>{ps.length} unpaid session{ps.length!==1?'s':''}</div>
+            </div>
+            <button onClick={next} style={{...S.btnSm,flex:'none',width:38,padding:'9px',fontSize:18,textAlign:'center'}}>&#8250;</button>
+          </div>
+        </div>
+        <div style={S.card}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:10}}>
+            <div style={{fontSize:12,fontWeight:600,color:'#475569'}}>Pay Rates</div>
+            <button onClick={()=>{setEditHr(String(hr));setShowRateEdit(!showRateEdit);}} style={{background:'none',border:'1px solid #CBD5E1',borderRadius:7,padding:'4px 10px',fontSize:11,color:'#475569',cursor:'pointer',fontFamily:'inherit'}}>Edit</button>
+          </div>
+          {showRateEdit?(
+            <div style={{background:'#F8FAFC',borderRadius:10,padding:'12px',marginBottom:4}}>
+              <div style={{fontSize:11,fontWeight:600,color:'#64748B',marginBottom:6}}>Hourly Rate ($/hr)</div>
+              <div style={{display:'flex',gap:8}}>
+                <input type="number" value={editHr} onChange={e=>setEditHr(e.target.value)} step="0.25" style={{...S.input,flex:1,fontSize:14}}/>
+                <button onClick={saveRateEdit} style={{...S.btnSm,background:'#059669',color:'white',border:'none',fontWeight:700,whiteSpace:'nowrap'}}>Save</button>
+              </div>
+              <div style={{fontSize:11,color:'#94A3B8',marginTop:6}}>Mileage locked to 2026 IRS rate: $0.725/mi</div>
+            </div>
+          ):(
+            <div style={{display:'flex',gap:12}}>
+              <div style={{flex:1,background:'#F0FDF4',borderRadius:8,padding:'10px',textAlign:'center'}}>
+                <div style={{fontSize:18,fontWeight:800,color:'#059669'}}>${hr.toFixed(2)}</div>
+                <div style={{fontSize:10,color:'#64748B',marginTop:2}}>per hour</div>
+              </div>
+              <div style={{flex:1,background:'#EFF6FF',borderRadius:8,padding:'10px',textAlign:'center'}}>
+                <div style={{fontSize:18,fontWeight:800,color:'#1D4ED8'}}>${mr.toFixed(4)}</div>
+                <div style={{fontSize:10,color:'#64748B',marginTop:2}}>per mile (2026 IRS)</div>
+              </div>
+            </div>
+          )}
+        </div>
+        <div style={S.card}>
+          <div style={S.hdiv}>Pay Summary</div>
+          {[
+            {l:`Hours - ${totHrs.toFixed(2)} hrs x $${hr.toFixed(2)}/hr`,v:cur(hPay)},
+            {l:`Mileage - ${totMi.toFixed(2)} mi x $${mr}/mi`,v:cur(mPay)},
+            {l:'Tolls',v:cur(totTolls)},
+          ].map(({l,v})=>(
+            <div key={l} style={{display:'flex',justifyContent:'space-between',padding:'9px 0',borderBottom:'1px solid #F1F5F9'}}><div style={{fontSize:13,color:'#475569'}}>{l}</div><div style={{fontSize:13,fontWeight:600}}>{v}</div></div>
+          ))}
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',paddingTop:12}}>
+            <div style={{fontSize:15,fontWeight:700,color:'#064E3B'}}>Total Due</div>
+            <div style={{fontSize:28,fontWeight:900,color:'#059669',letterSpacing:'-0.02em'}}>{cur(total)}</div>
+          </div>
+        </div>
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:10,marginBottom:12}}>
+          {[{n:ps.length,l:'Sessions',i:'&amp;#x23F1;'},{n:pc.length,l:'Cold Chain',i:'&amp;#x1F321;'},{n:pm.length,l:'Manifests',i:'&amp;#x1F4CB;'}].map(({n,l,i})=>(
+            <div key={l} style={{background:'white',borderRadius:10,padding:'13px 8px',textAlign:'center',boxShadow:'0 1px 3px rgba(0,0,0,0.05)'}}><div style={{fontSize:22}} dangerouslySetInnerHTML={{__html:i}}/><div style={{fontSize:20,fontWeight:800,color:'#1B2B5E',marginTop:4}}>{n}</div><div style={{fontSize:10,color:'#94A3B8',marginTop:2}}>{l}</div></div>
+          ))}
+        </div>
+        {periodTolls.length>0&&(
+          <div style={S.card}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+              <div style={{fontSize:12,fontWeight:600,color:'#475569'}}>Toll Ledger - This Period</div>
+              <span style={{fontSize:13,fontWeight:700,color:'#1B2B5E'}}>{cur(standaloneTolls)}</span>
+            </div>
+            {periodTolls.map(t=>(
+              <div key={t.id} style={{display:'flex',justifyContent:'space-between',padding:'7px 0',borderBottom:'1px solid #F1F5F9',fontSize:12}}>
+                <span style={{color:'#475569'}}>{t.date}{t.notes?` - ${t.notes}`:''}</span>
+                <span style={{fontWeight:600}}>{cur(t.amount)}</span>
+              </div>
+            ))}
+          </div>
+        )}
+        <div style={{display:'flex',gap:8,marginBottom:8}}>
+          <button onClick={()=>setShowAddToll(true)} style={{...S.btnSm,flex:'none',background:'white',border:'1px solid #CBD5E1',color:'#475569',fontFamily:'inherit',fontSize:13}}>+ Toll</button>
+          <button onClick={send} disabled={ps.length===0} style={{...S.btnP,flex:1,background:ps.length>0?'linear-gradient(135deg,#064E3B,#059669)':'#E2E8F0',color:ps.length>0?'white':'#94A3B8',cursor:ps.length>0?'pointer':'default',display:'flex',alignItems:'center',justifyContent:'center',gap:10,marginBottom:0}}>
+            Submit Invoice via Email
+          </button>
+        </div>
+        {ps.length>0&&(
+          <button onClick={markPaid} style={{...S.btnP,background:'white',border:'2px solid #059669',color:'#059669',marginBottom:0}}>
+            Mark All as Paid (hide from future invoices)
+          </button>
+        )}
+        <div style={{fontSize:11,color:'#94A3B8',textAlign:'center',marginTop:7}}>Sends to {billingEmail}</div>
+      </div>
+      {showAddToll&&<AddTollModal onSave={t=>{onAddToll(t);setShowAddToll(false);}} onCancel={()=>setShowAddToll(false)}/>}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════
+// DRUG MANAGER PORTAL — with Excel upload
+// ══════════════════════════════════════════════════════
+function DrugManagerPortal({runs,onSaveRun,onDelRun,onClose,fbMode}){
+  const[authed,setAuthed]=useState(false),[pw,setPw]=useState(''),[pwErr,setPwErr]=useState(false);
+  const[view,setView]=useState('list');
+  const today=todayISO();
+  const[runDate,setRunDate]=useState(today);
+  const[stops,setStops]=useState([{id:uid(),location:'',drugs:[{id:uid(),drug:null,qty:'',lot:'',expDate:''}]}]);
+  const[saved,setSaved]=useState(false);
+  const[xlsxPreview,setXlsxPreview]=useState(null);
+  const[xlsxError,setXlsxError]=useState('');
+  const[xlsxSaved,setXlsxSaved]=useState(false);
+
+  const login=()=>{if(pw===MGR_PASSWORD){setAuthed(true);setPwErr(false);}else setPwErr(true);};
+  const addStop=()=>setStops(p=>[...p,{id:uid(),location:'',drugs:[{id:uid(),drug:null,qty:'',lot:'',expDate:''}]}]);
+  const delStop=id=>setStops(p=>p.filter(s=>s.id!==id));
+  const setStop=(id,k,v)=>setStops(p=>p.map(s=>s.id===id?{...s,[k]:v}:s));
+  const addDrug=sid=>setStops(p=>p.map(s=>s.id===sid?{...s,drugs:[...s.drugs,{id:uid(),drug:null,qty:'',lot:'',expDate:''}]}:s));
+  const delDrug=(sid,did)=>setStops(p=>p.map(s=>s.id===sid?{...s,drugs:s.drugs.filter(d=>d.id!==did)}:s));
+  const setDrug=(sid,did,k,v)=>setStops(p=>p.map(s=>s.id===sid?{...s,drugs:s.drugs.map(d=>d.id===did?{...d,[k]:v}:d)}:s));
+
+  const saveRun=()=>{
+    if(!runDate){alert('Select a date.');return;}
+    if(!stops.every(s=>s.location&&s.drugs.every(d=>d.drug))){alert('Select location and at least one drug for each stop.');return;}
+    const run={id:uid(),date:runDate,stops:stops.map(s=>({location:s.location,drugs:s.drugs.map(d=>({name:d.drug.name,ndc:d.drug.ndc,mfr:d.drug.mfr,qty:d.qty,lot:d.lot,expDate:d.expDate}))})),createdAt:Date.now()};
+    onSaveRun(run);
+    setStops([{id:uid(),location:'',drugs:[{id:uid(),drug:null,qty:'',lot:'',expDate:''}]}]);setRunDate(today);
+    setSaved(true);setTimeout(()=>{setSaved(false);setView('list');},2000);
+  };
+
+  const handleXLSX=e=>{
+    const file=e.target.files[0];if(!file)return;
+    setXlsxError('');setXlsxPreview(null);setXlsxSaved(false);
+    const reader=new FileReader();
+    reader.onload=ev=>{
+      e.target.value='';
+      try{
+        const wb=XLSX.read(ev.target.result,{type:'array'});
+        const ws=wb.Sheets[wb.SheetNames[0]];
+        const raw=XLSX.utils.sheet_to_json(ws,{header:1,defval:''});
+
+        // Find header row — must have 'Delivery Date' AND 'Delivery Location' as INDIVIDUAL cells
+        // (not buried inside a long instruction sentence)
+        let headerIdx=-1;
+        for(let i=0;i<raw.length;i++){
+          const cells=raw[i].map(c=>String(c||'').trim().toLowerCase());
+          const hasDate=cells.some(c=>c==='delivery date');
+          const hasLoc=cells.some(c=>c==='delivery location');
+          if(hasDate&&hasLoc){headerIdx=i;break;}
+        }
+        if(headerIdx===-1){
+          setXlsxError('Could not find the header row. Make sure your file has columns exactly named "Delivery Date" and "Delivery Location". Download the template for the correct format.');
+          return;
+        }
+
+        const headers=raw[headerIdx].map(h=>String(h||'').trim());
+        const dataRows=raw.slice(headerIdx+1).filter(r=>r.some(c=>String(c||'').trim()!=''));
+        if(!dataRows.length){setXlsxError('No data rows found below the header row.');return;}
+
+        // Convert Excel serial date number → YYYY-MM-DD string
+        const parseDate=val=>{
+          const s=String(val||'').trim();
+          if(!s)return today;
+          const n=Number(s);
+          if(!isNaN(n)&&n>40000){
+            // Excel serial date: days since Jan 1 1900 (with Excel's leap-year bug offset of 25569 to Unix epoch)
+            const d=new Date((n-25569)*86400*1000);
+            return d.toISOString().slice(0,10);
+          }
+          return s; // already a string date
+        };
+
+        // Map row array → object using detected headers
+        const toObj=row=>{
+          const obj={};
+          headers.forEach((h,i)=>{obj[h]=String(row[i]||'').trim();});
+          return obj;
+        };
+
+        // Case-insensitive key lookup with fallback aliases
+        const get=(obj,...keys)=>{
+          for(const k of keys){
+            const found=Object.keys(obj).find(ok=>ok.toLowerCase()===k.toLowerCase());
+            if(found&&obj[found])return String(obj[found]).trim();
+          }
+          return '';
+        };
+
+        const groups={};
+        dataRows.forEach(rawRow=>{
+          const r=toObj(rawRow);
+          const date=parseDate(get(r,'delivery date','date'));
+          const loc=get(r,'delivery location','location','destination');
+          const drugName=get(r,'drug name','drug','name');
+          const qty=get(r,'qty *required*','qty','quantity');
+          if(!loc||!drugName)return;
+          const key=`${date}||${loc}`;
+          if(!groups[key])groups[key]={date,location:loc,drugs:[]};
+          const matchedDrug=DRUG_MASTER.find(d=>
+            d.name.toLowerCase()===drugName.toLowerCase()||
+            d.ndc.replace(/-/g,'')===drugName.replace(/-/g,'').replace(/\s/g,'')
+          );
+          groups[key].drugs.push({
+            name:matchedDrug?.name||drugName,
+            ndc:matchedDrug?.ndc||get(r,'ndc','ndccode'),
+            mfr:matchedDrug?.mfr||'',
+            qty,
+            lot:get(r,'lot # (optional)','lot #','lot number','lot'),
+            expDate:get(r,'exp date (optional)','exp date','expiration date','exp'),
+          });
+        });
+
+        const preview=Object.values(groups);
+        if(!preview.length){setXlsxError('No valid drug rows found. Make sure Delivery Location and Drug Name columns are filled in.');return;}
+        setXlsxPreview(preview);
+      }catch(err){setXlsxError('Error reading file: '+err.message+'. Make sure you are uploading an .xlsx file.');}
+    };
+    reader.onerror=()=>setXlsxError('Could not read the file. Please try again.');
+    reader.readAsArrayBuffer(file);
+  };
+
+  const saveXLSXRun=()=>{
+    if(!xlsxPreview)return;
+    // Group stops by date into runs
+    const byDate={};
+    xlsxPreview.forEach(g=>{
+      if(!byDate[g.date])byDate[g.date]=[];
+      byDate[g.date].push({location:g.location,drugs:g.drugs});
+    });
+    Object.entries(byDate).forEach(([date,stops])=>{
+      onSaveRun({id:uid(),date,stops,createdAt:Date.now(),source:'xlsx'});
+    });
+    setXlsxPreview(null);setXlsxSaved(true);setTimeout(()=>{setXlsxSaved(false);setView('list');},2000);
+  };
+
+  if(!authed)return(
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.75)',zIndex:1000,display:'flex',alignItems:'center',justifyContent:'center',padding:20}}>
+      <div style={{background:'white',borderRadius:20,padding:28,width:'100%',maxWidth:380,boxShadow:'0 20px 60px rgba(0,0,0,0.3)'}}>
+        <div style={{textAlign:'center',marginBottom:24}}><div style={{fontSize:36,marginBottom:8}}>💊</div><div style={{fontSize:20,fontWeight:800,color:'#1B2B5E'}}>Drug Manager Portal</div><div style={{fontSize:12,color:'#94A3B8',marginTop:4}}>CFRC — Authorized Staff Only</div></div>
+        <div style={{fontSize:12,color:fbMode?'#059669':'#F59E0B',background:fbMode?'#F0FDF4':'#FFFBEB',border:`1px solid ${fbMode?'#86EFAC':'#FDE68A'}`,borderRadius:8,padding:'8px 12px',marginBottom:12,textAlign:'center'}}>
+          {fbMode?'🟢 Firebase Connected — runs sync in real time':'🟡 Offline Mode — runs saved locally only'}
+        </div>
+        <input type="password" value={pw} onChange={e=>setPw(e.target.value)} onKeyDown={e=>e.key==='Enter'&&login()} placeholder="Enter portal password" style={{...S.input,marginBottom:10,borderColor:pwErr?'#EF4444':'#CBD5E1'}}/>
+        {pwErr&&<div style={{color:'#DC2626',fontSize:12,marginBottom:10}}>Incorrect password.</div>}
+        <button onClick={login} style={{...S.btnP,background:'linear-gradient(135deg,#1B2B5E,#2E4FAF)',marginBottom:10}}>Sign In</button>
+        <button onClick={onClose} style={{...S.btnSm,width:'100%',textAlign:'center',padding:'12px'}}>Cancel</button>
+      </div>
+    </div>
+  );
+
+  return(
+    <div style={{position:'fixed',inset:0,background:'#EEF2FF',zIndex:1000,overflowY:'auto',maxWidth:480,margin:'0 auto'}}>
+      <div style={{background:'linear-gradient(135deg,#064E3B,#059669)',padding:'40px 20px 16px',color:'white',display:'flex',justifyContent:'space-between',alignItems:'flex-start'}}>
+        <div>
+          <div style={{fontSize:10,opacity:0.6,textTransform:'uppercase',letterSpacing:'0.08em'}}>CFRC Drug Manager</div>
+          <div style={{fontSize:22,fontWeight:900,letterSpacing:'-0.02em',marginTop:4}}>Delivery Run Manager</div>
+          <div style={{fontSize:11,opacity:0.7,marginTop:6}}>{fbMode?'🟢 Firebase — real-time sync':'🟡 Local only'}</div>
+        </div>
+        <button onClick={onClose} style={{background:'rgba(255,255,255,0.2)',border:'none',borderRadius:8,color:'white',fontSize:13,fontWeight:600,padding:'8px 12px',cursor:'pointer',fontFamily:'inherit'}}>✕ Close</button>
+      </div>
+      <div style={{display:'flex',borderBottom:'1px solid #E2E8F0',background:'white'}}>
+        {[['list',`Runs (${runs.length})`],['upload','📊 Upload Excel'],['create','+ Manual']].map(([v,l])=>(
+          <button key={v} onClick={()=>setView(v)} style={{flex:1,padding:'12px 4px',border:'none',background:'none',cursor:'pointer',fontSize:12,fontWeight:view===v?700:500,color:view===v?'#059669':'#64748B',borderBottom:view===v?'2.5px solid #059669':'2.5px solid transparent',fontFamily:'inherit'}}>{l}</button>
+        ))}
+      </div>
+
+      {/* All Runs */}
+      {view==='list'&&(
+        <div style={{padding:'14px',paddingBottom:40}}>
+          {runs.length===0
+            ?<div style={{textAlign:'center',padding:'50px 20px',color:'#94A3B8'}}><div style={{fontSize:36,marginBottom:12}}>📦</div><div style={{fontSize:14}}>No runs yet</div><button onClick={()=>setView('upload')} style={{marginTop:14,background:'#059669',border:'none',borderRadius:10,color:'white',fontSize:13,fontWeight:600,padding:'10px 20px',cursor:'pointer',fontFamily:'inherit'}}>Upload Excel File</button></div>
+            :[...runs].reverse().map(r=>(
+              <div key={r.id} style={{background:'white',borderRadius:12,padding:'14px',marginBottom:10,boxShadow:'0 1px 3px rgba(0,0,0,0.05)',borderLeft:`3px solid ${r.date===today?'#059669':'#CBD5E1'}`}}>
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start'}}>
+                  <div style={{flex:1}}>
+                    <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap',marginBottom:6}}>
+                      <div style={{fontSize:13,fontWeight:700,color:'#1E293B'}}>{new Date(r.date+'T12:00:00').toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'})}</div>
+                      {r.date===today&&<span style={{fontSize:10,fontWeight:700,background:'#DCFCE7',color:'#059669',padding:'2px 8px',borderRadius:20}}>TODAY</span>}
+                      {r.source==='xlsx'&&<span style={{fontSize:10,fontWeight:600,background:'#EFF6FF',color:'#1D4ED8',padding:'2px 8px',borderRadius:20}}>XLSX</span>}
+                    </div>
+                    {r.stops.map((s,i)=><div key={i} style={{fontSize:12,color:'#475569',marginBottom:3}}><span style={{fontWeight:600}}>Stop {i+1}:</span> {s.location} — {s.drugs.map(d=>d.name.split(' ').slice(0,2).join(' ')).join(', ')}</div>)}
+                  </div>
+                  <button onClick={()=>onDelRun(r.id)} style={{background:'none',border:'none',color:'#FCA5A5',cursor:'pointer',fontSize:17,padding:4}}>✕</button>
+                </div>
+              </div>
+            ))
+          }
+        </div>
+      )}
+
+      {/* Excel Upload */}
+      {view==='upload'&&(
+        <div style={{padding:'14px',paddingBottom:60}}>
+          {xlsxSaved&&<div style={{background:'#ECFDF5',border:'1px solid #6EE7B7',borderRadius:10,padding:'12px 14px',marginBottom:12,color:'#065F46',fontSize:13,fontWeight:600}}>✓ Runs saved from Excel file{fbMode?' — synced to driver in real time':''}</div>}
+          <div style={{...S.card,background:'#F0FDF4',border:'1px solid #86EFAC'}}>
+            <div style={{fontSize:13,fontWeight:700,color:'#065F46',marginBottom:8}}>Step 1: Download the Template</div>
+            <div style={{fontSize:12,color:'#047857',marginBottom:12,lineHeight:1.5}}>Use the Excel template to enter all drugs and quantities. One row per drug. Rows with the same date + delivery location are grouped into one stop automatically.</div>
+            <button onClick={downloadXLSXTemplate} style={{...S.btnP,background:'#059669',fontSize:13}}>⬇ Download Drug Run Template (.xlsx)</button>
+          </div>
+          <div style={S.card}>
+            <div style={{fontSize:13,fontWeight:700,color:'#1B2B5E',marginBottom:8}}>Step 2: Upload Completed File</div>
+            <div style={{border:'2px dashed #CBD5E1',borderRadius:10,padding:'24px',textAlign:'center',background:'#F8FAFC',marginBottom:10}}>
+              <div style={{fontSize:28,marginBottom:8}}>📊</div>
+              <div style={{fontSize:13,color:'#475569',marginBottom:12}}>Select your filled-in Excel file</div>
+              <label style={{display:'inline-block',background:'#1B2B5E',color:'white',padding:'10px 20px',borderRadius:8,cursor:'pointer',fontSize:13,fontWeight:600}}>
+                Choose .xlsx File
+                <input type="file" accept=".xlsx,.xls,.csv" onChange={handleXLSX} style={{display:'none'}}/>
+              </label>
+            </div>
+            {xlsxError&&<div style={{background:'#FEF2F2',border:'1px solid #FECACA',borderRadius:8,padding:'10px 12px',color:'#991B1B',fontSize:12,marginBottom:10}}>{xlsxError}</div>}
+          </div>
+          {xlsxPreview&&(
+            <div style={S.card}>
+              <div style={{fontSize:13,fontWeight:700,color:'#1B2B5E',marginBottom:12}}>Step 3: Review & Publish</div>
+              {xlsxPreview.map((g,i)=>(
+                <div key={i} style={{background:'#F8FAFC',borderRadius:10,padding:'12px',marginBottom:8,border:'1px solid #E2E8F0'}}>
+                  <div style={{fontSize:12,fontWeight:700,color:'#1E293B',marginBottom:6}}>{g.location} <span style={{fontWeight:400,color:'#94A3B8'}}>— {g.date}</span></div>
+                  {g.drugs.map((d,j)=>(
+                    <div key={j} style={{fontSize:12,color:'#475569',padding:'4px 0',borderTop:j>0?'1px solid #F1F5F9':'none'}}>
+                      <span style={{fontWeight:500}}>{d.name}</span>
+                      {d.qty&&<span style={{color:'#94A3B8',marginLeft:8}}>Qty: {d.qty}</span>}
+                      {d.lot&&<span style={{color:'#94A3B8',marginLeft:8}}>Lot: {d.lot}</span>}
+                      {!d.ndc&&<span style={{color:'#F59E0B',marginLeft:8,fontSize:11}}>⚠ NDC not matched</span>}
+                    </div>
+                  ))}
+                </div>
+              ))}
+              <div style={{fontSize:11,color:'#94A3B8',marginBottom:12}}>
+                {xlsxPreview.reduce((a,g)=>a+g.drugs.length,0)} drugs across {xlsxPreview.length} stop{xlsxPreview.length!==1?'s':''}
+              </div>
+              <button onClick={saveXLSXRun} style={{...S.btnP,background:'linear-gradient(135deg,#064E3B,#059669)'}}>📤 Publish to Driver</button>
+              <button onClick={()=>setXlsxPreview(null)} style={{...S.btnSm,width:'100%',marginTop:8,padding:'12px',textAlign:'center'}}>Cancel — Re-upload</button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Manual Create */}
+      {view==='create'&&(
+        <div style={{padding:'14px',paddingBottom:60}}>
+          {saved&&<div style={{background:'#ECFDF5',border:'1px solid #6EE7B7',borderRadius:10,padding:'12px 14px',marginBottom:12,color:'#065F46',fontSize:13,fontWeight:600}}>✓ Run saved — driver sees it immediately</div>}
+          <div style={S.card}><FR label="Delivery Date" req><input type="date" value={runDate} onChange={e=>setRunDate(e.target.value)} style={S.input}/></FR></div>
+          {stops.map((stop,si)=>(
+            <div key={stop.id} style={{...S.card,border:'1px solid #E2E8F0'}}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12}}>
+                <div style={{fontSize:13,fontWeight:700,color:'#1B2B5E'}}>Stop {si+1}</div>
+                {stops.length>1&&<button onClick={()=>delStop(stop.id)} style={{background:'none',border:'none',color:'#EF4444',cursor:'pointer',fontSize:12,fontWeight:600,fontFamily:'inherit'}}>Remove</button>}
+              </div>
+              <FR label="Delivery Location" req><Sel value={stop.location} onChange={v=>setStop(stop.id,'location',v)} options={['',...LOCS.filter(l=>l!=='Orange City (Main)')]} ph="Select destination"/></FR>
+              <div style={{fontSize:12,fontWeight:600,color:'#475569',marginBottom:8,marginTop:4}}>Drugs:</div>
+              {stop.drugs.map((drug,di)=>(
+                <div key={drug.id} style={{background:'#F8FAFC',borderRadius:10,padding:'12px',marginBottom:8,border:'1px solid #E2E8F0'}}>
+                  <div style={{display:'flex',justifyContent:'space-between',marginBottom:8}}>
+                    <div style={{fontSize:12,fontWeight:600,color:'#64748B'}}>Drug {di+1}</div>
+                    {stop.drugs.length>1&&<button onClick={()=>delDrug(stop.id,drug.id)} style={{background:'none',border:'none',color:'#EF4444',fontSize:12,cursor:'pointer',fontFamily:'inherit'}}>Remove</button>}
+                  </div>
+                  <FR label="Drug Name & NDC" req><DrugSearch value={drug.drug?.name||''} ndc={drug.drug?.ndc} onChange={d=>setDrug(stop.id,drug.id,'drug',d)} onClear={()=>setDrug(stop.id,drug.id,'drug',null)}/></FR>
+                  <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:8,marginTop:4}}>
+                    <FR label="Qty"><TIn value={drug.qty} onChange={v=>setDrug(stop.id,drug.id,'qty',v)} placeholder="e.g. 2"/></FR>
+                    <FR label="Lot #"><TIn value={drug.lot} onChange={v=>setDrug(stop.id,drug.id,'lot',v)} placeholder="Lot"/></FR>
+                    <FR label="Exp Date"><TIn type="date" value={drug.expDate} onChange={v=>setDrug(stop.id,drug.id,'expDate',v)}/></FR>
+                  </div>
+                </div>
+              ))}
+              <button onClick={()=>addDrug(stop.id)} style={{...S.btnSm,width:'100%',color:'#0369A1',borderColor:'#BAE6FD',background:'#F0F9FF',fontWeight:600,padding:'10px',marginTop:2}}>+ Add Drug</button>
+            </div>
+          ))}
+          <button onClick={addStop} style={{...S.btnSm,width:'100%',marginBottom:12,padding:'12px',color:'#1B2B5E',borderColor:'#C7D2FE',background:'#EEF2FF',fontWeight:600,fontSize:13}}>+ Add Another Stop</button>
+          <button onClick={saveRun} style={{...S.btnP,background:'linear-gradient(135deg,#064E3B,#059669)'}}>📤 Save & Publish Run to Driver</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════
+// NAV BAR
+// ══════════════════════════════════════════════════════
+const TABS=[{id:'home',l:'Home',i:'🏠'},{id:'tracker',l:'Track',i:'⏱'},{id:'coldchain',l:'Cold Chain',i:'🌡'},{id:'manifest',l:'Manifest',i:'📋'},{id:'invoice',l:'Invoice',i:'📄'}];
+function NavBar({tab,onTab,isTracking,onMgr,pendingCount}){
+  return(
+    <div style={{position:'fixed',bottom:0,left:0,right:0,background:'white',borderTop:'1px solid #E2E8F0',display:'flex',zIndex:200,maxWidth:480,margin:'0 auto',boxShadow:'0 -2px 12px rgba(0,0,0,0.06)'}}>
+      {TABS.map(({id,l,i})=>{
+        const a=tab===id;
+        return(
+          <button key={id} onClick={()=>onTab(id)} style={{flex:1,padding:'8px 2px 10px',border:'none',background:'none',cursor:'pointer',display:'flex',flexDirection:'column',alignItems:'center',gap:2,fontFamily:'inherit',position:'relative'}}>
+            {id==='tracker'&&isTracking&&<div style={{position:'absolute',top:6,right:'20%',width:7,height:7,borderRadius:'50%',background:'#10B981',border:'2px solid white'}}/>}
+            {id==='coldchain'&&pendingCount>0&&<div style={{position:'absolute',top:6,right:'18%',background:'#F59E0B',color:'white',fontSize:8,fontWeight:800,borderRadius:8,padding:'1px 4px',minWidth:14,textAlign:'center'}}>{pendingCount}</div>}
+            <div style={{fontSize:18}}>{i}</div>
+            <div style={{fontSize:9,fontWeight:a?700:500,color:a?'#1B2B5E':'#94A3B8',textTransform:'uppercase',letterSpacing:'0.04em'}}>{l}</div>
+            {a&&<div style={{position:'absolute',bottom:0,left:'20%',right:'20%',height:2.5,background:'#1B2B5E',borderRadius:2}}/>}
+          </button>
+        );
+      })}
+      <button onClick={onMgr} style={{flex:1,padding:'8px 2px 10px',border:'none',background:'none',cursor:'pointer',display:'flex',flexDirection:'column',alignItems:'center',gap:2,fontFamily:'inherit'}}>
+        <div style={{fontSize:18}}>💊</div>
+        <div style={{fontSize:9,fontWeight:500,color:'#94A3B8',textTransform:'uppercase',letterSpacing:'0.04em'}}>Mgr</div>
+      </button>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════
+// ROOT APP
+// ══════════════════════════════════════════════════════
+function App(){
+  const[tab,setTab]=useState('home');
+  const[isTracking,setIsTracking]=useState(false);
+  const[sessionStart,setSessionStart]=useState(null);
+  const[elapsed,setElapsed]=useState(0),[totalMiles,setTotalMiles]=useState(0);
+  const[gpsStatus,setGpsStatus]=useState('idle');
+  const[timeOnlyMode,setTimeOnlyMode]=useState(false);
+  const[sessions,setSessions]=useState([]);
+  const[coldChainLogs,setCCLogs]=useState([]);
+  const[manifests,setManifests]=useState([]);
+  const[runs,setRuns]=useState([]);
+  const[tolls,setTolls]=useState([]);
+  const[showMgr,setShowMgr]=useState(false);
+  const[fbMode,setFbMode]=useState(false);
+  const[config,setConfig]=useState(null);      // null = not yet loaded
+  const[showSetup,setShowSetup]=useState(false);
+  const[showSettings,setShowSettings]=useState(false);
+
+  const watchRef=useRef(null),timerRef=useRef(null),lastPos=useRef(null),milesAcc=useRef(0),sessionStartTs=useRef(null),timeOnlyRef=useRef(false),wakeLockRef=useRef(null);
+
+  useEffect(()=>{
+    const cfg=loadConfig();
+    setConfig(cfg);
+    if(!cfg.setupDone){setShowSetup(true);return;}
+    setSessions(LS.get('cfrc:sessions')||[]);
+    setCCLogs(LS.get('cfrc:cc')||[]);
+    setManifests(LS.get('cfrc:mfst')||[]);
+    setTolls(LS.get('cfrc:tolls')||[]);
+    initFirebase();
+    if(firebaseDB){setFbMode(true);firebaseDB.ref('cfrc/runs').on('value',snap=>{const data=snap.val();setRuns(data?Object.values(data):[]);});}
+    else{setRuns(LS.get('cfrc:runs')||[]);}
+  },[]);
+
+  // Wall-clock timer — immune to background tab throttling
+  useEffect(()=>{
+    if(isTracking){timerRef.current=setInterval(()=>{if(sessionStartTs.current)setElapsed(Math.floor((Date.now()-sessionStartTs.current)/1000));},1000);}
+    else clearInterval(timerRef.current);
+    return()=>clearInterval(timerRef.current);
+  },[isTracking]);
+
+  // ── Helper: start GPS watch and wire up localStorage persistence ──────
+  const startGpsWatch=useCallback(()=>{
+    if(!navigator.geolocation)return;
+    if(watchRef.current!==null){navigator.geolocation.clearWatch(watchRef.current);watchRef.current=null;}
+    watchRef.current=navigator.geolocation.watchPosition(p=>{
+      const{latitude:la,longitude:lo}=p.coords;
+      if(lastPos.current){
+        const d=haversine(lastPos.current.lat,lastPos.current.lon,la,lo);
+        if(d>0.01){
+          milesAcc.current+=d;
+          setTotalMiles(milesAcc.current);
+          lastPos.current={lat:la,lon:lo};
+          // Persist miles continuously so a kill doesn't lose them
+          const ar=LS.get('cfrc:activeRun');
+          if(ar)LS.set('cfrc:activeRun',{...ar,accMiles:milesAcc.current,lastLat:la,lastLon:lo});
+        }
+      } else {
+        lastPos.current={lat:la,lon:lo};
+        // Save first-fix coords too so gap bridging works even before first movement
+        const ar=LS.get('cfrc:activeRun');
+        if(ar&&!ar.lastLat)LS.set('cfrc:activeRun',{...ar,lastLat:la,lastLon:lo});
+      }
+      setGpsStatus('locked');
+    },()=>setGpsStatus('error'),{enableHighAccuracy:true,maximumAge:5000,timeout:30000});
+  },[]);
+
+  // ── Helper: request Wake Lock (keeps PWA alive like step-counter apps) ─
+  const acquireWakeLock=useCallback(async()=>{
+    if(!('wakeLock' in navigator))return;
+    try{wakeLockRef.current=await navigator.wakeLock.request('screen');}catch(e){}
+  },[]);
+
+  // ── On mount: recover interrupted session from localStorage ───────────
+  useEffect(()=>{
+    const ar=LS.get('cfrc:activeRun');
+    if(!ar||!ar.startTs)return;
+    // Restore refs and state immediately so timer shows correct time
+    sessionStartTs.current=ar.startTs;
+    milesAcc.current=ar.accMiles||0;
+    timeOnlyRef.current=ar.timeOnly||false;
+    setSessionStart(ar.startTs);
+    setTotalMiles(ar.accMiles||0);
+    setElapsed(Math.floor((Date.now()-ar.startTs)/1000));
+    setTimeOnlyMode(ar.timeOnly||false);
+    setGpsStatus(ar.timeOnly?'timeonly':'recovering');
+    setIsTracking(true);
+    acquireWakeLock();
+    // ── Gap bridging: get current position and haversine from last saved ──
+    if(!ar.timeOnly&&isSecure()&&ar.lastLat!=null&&ar.lastLon!=null&&navigator.geolocation){
+      navigator.geolocation.getCurrentPosition(pos=>{
+        const{latitude:la,longitude:lo}=pos.coords;
+        const gapMiles=haversine(ar.lastLat,ar.lastLon,la,lo);
+        if(gapMiles>0.01){
+          milesAcc.current+=gapMiles;
+          setTotalMiles(milesAcc.current);
+          LS.set('cfrc:activeRun',{...ar,accMiles:milesAcc.current,lastLat:la,lastLon:lo,gapBridged:gapMiles});
+          setGapBridged(parseFloat(gapMiles.toFixed(2)));
+        }
+        lastPos.current={lat:la,lon:lo};
+        setGpsStatus('locked');
+        startGpsWatch();
+      },()=>{
+        // Can't get current position — just resume GPS watch from wherever it picks up
+        startGpsWatch();
+      },{enableHighAccuracy:true,timeout:15000,maximumAge:0});
+    } else if(!ar.timeOnly&&isSecure()){
+      startGpsWatch();
+    }
+  },[]);// eslint-disable-line
+
+  const[gapBridged,setGapBridged]=useState(0);
+  const[showBgModal,setShowBgModal]=useState(false);
+  const[showBgTutorial,setShowBgTutorial]=useState(false);
+
+  // ── Send persistent notification so user can tap back in ─────────────
+  const sendTrackingNotification=useCallback((startTs)=>{
+    if(!('Notification' in window))return;
+    const send=()=>{
+      if(Notification.permission!=='granted')return;
+      try{
+        new Notification('🟢 RxRunner is tracking',{
+          body:'Session running — tap here to return to the app',
+          icon:'',
+          tag:'rxrunner-tracking', // replaces previous, no spam
+          renotify:false,
+          requireInteraction:true, // stays on screen until dismissed
+        });
+      }catch(e){}
+    };
+    if(Notification.permission==='granted'){send();}
+    else if(Notification.permission!=='denied'){
+      Notification.requestPermission().then(p=>{if(p==='granted')send();});
+    }
+  },[]);
+
+  // ── Open bg guide modal + send notification ───────────────────────────
+  const openBgGuide=useCallback(()=>{
+    sendTrackingNotification(sessionStartTs.current);
+    setShowBgModal(true);
+  },[sendTrackingNotification]);
+
+  // ── Visibility change: re-sync when user returns to app ───────────────
+  useEffect(()=>{
+    const onVisible=()=>{
+      if(document.visibilityState!=='visible'||!sessionStartTs.current)return;
+      const ar=LS.get('cfrc:activeRun');
+      if(ar&&ar.startTs){
+        sessionStartTs.current=ar.startTs;
+        // Gap bridging on return-to-app
+        if(!timeOnlyRef.current&&isSecure()&&ar.lastLat!=null&&ar.lastLon!=null&&navigator.geolocation){
+          navigator.geolocation.getCurrentPosition(pos=>{
+            const{latitude:la,longitude:lo}=pos.coords;
+            const gapMiles=haversine(ar.lastLat,ar.lastLon,la,lo);
+            if(gapMiles>0.01){
+              milesAcc.current+=gapMiles;
+              setTotalMiles(milesAcc.current);
+              LS.set('cfrc:activeRun',{...ar,accMiles:milesAcc.current,lastLat:la,lastLon:lo});
+              setGapBridged(prev=>parseFloat((prev+gapMiles).toFixed(2)));
+            }
+            lastPos.current={lat:la,lon:lo};
+          },null,{enableHighAccuracy:true,timeout:10000,maximumAge:0});
+        }
+      }
+      setElapsed(Math.floor((Date.now()-sessionStartTs.current)/1000));
+      acquireWakeLock();
+      if(!timeOnlyRef.current&&isSecure()&&watchRef.current===null)startGpsWatch();
+    };
+    document.addEventListener('visibilitychange',onVisible);
+    return()=>document.removeEventListener('visibilitychange',onVisible);
+  },[startGpsWatch,acquireWakeLock]);
+
+  const startSession=useCallback((timeOnly)=>{
+    const forceTimeOnly=timeOnly||!isSecure();
+    timeOnlyRef.current=forceTimeOnly;
+    setTimeOnlyMode(forceTimeOnly);
+    const now=Date.now();
+    sessionStartTs.current=now;
+    setSessionStart(now);setTotalMiles(0);setElapsed(0);milesAcc.current=0;lastPos.current=null;
+    setGapBridged(0);
+    // Show first-time tutorial if user hasn't seen it
+    const seen=LS.get('cfrc:bgTutorialSeen');
+    if(!seen){setShowBgTutorial(true);LS.set('cfrc:bgTutorialSeen',true);}
+    // Request notification permission proactively
+    if('Notification' in window&&Notification.permission==='default'){
+      Notification.requestPermission();
+    }
+    // Persist session start immediately — survives app kill
+    LS.set('cfrc:activeRun',{startTs:now,accMiles:0,timeOnly:forceTimeOnly,gpsStatus:forceTimeOnly?'timeonly':'acquiring'});
+    if(forceTimeOnly){setIsTracking(true);setGpsStatus('timeonly');acquireWakeLock();return;}
+    setGpsStatus('acquiring');
+    navigator.geolocation.getCurrentPosition(pos=>{
+      const{latitude:lat,longitude:lon}=pos.coords;
+      lastPos.current={lat,lon};
+      setIsTracking(true);setGpsStatus('locked');
+      LS.set('cfrc:activeRun',{startTs:now,accMiles:0,timeOnly:false,gpsStatus:'locked'});
+      startGpsWatch();
+      acquireWakeLock();
+    },()=>{
+      timeOnlyRef.current=true;setTimeOnlyMode(true);
+      setIsTracking(true);setGpsStatus('error');
+      LS.set('cfrc:activeRun',{startTs:now,accMiles:0,timeOnly:true,gpsStatus:'error'});
+      acquireWakeLock();
+    },{enableHighAccuracy:true,timeout:12000});
+  },[startGpsWatch,acquireWakeLock]);
+
+  const endSession=useCallback((manualMilesOverride)=>{
+    if(watchRef.current!==null){navigator.geolocation.clearWatch(watchRef.current);watchRef.current=null;}
+    if(wakeLockRef.current){try{wakeLockRef.current.release();}catch(e){}wakeLockRef.current=null;}
+    setIsTracking(false);setGpsStatus('idle');
+    // Clear persisted active run — session is now complete
+    LS.set('cfrc:activeRun',null);
+    const endTime=Date.now();
+    const finalMiles=manualMilesOverride!=null?manualMilesOverride:milesAcc.current;
+    const s={id:Date.now(),date:fmtD(sessionStart),startTime:sessionStart,endTime,totalSeconds:Math.floor((endTime-sessionStart)/1000),totalMiles:finalMiles,timeOnly:timeOnlyRef.current,toll:0,paid:false,manual:false};
+    const u=[...sessions,s];setSessions(u);LS.set('cfrc:sessions',u);
+  },[sessions,sessionStart]);
+
+  const delSession=id=>{const u=sessions.filter(s=>s.id!==id);setSessions(u);LS.set('cfrc:sessions',u);};
+
+  // Manual Entry: build a session object from form data
+  const addManualSession=useCallback((data)=>{
+    const{date,startTs,endTs,secs,miles,toll,notes,startOdo,endOdo}=data;
+    const s={id:Date.now(),date,startTime:startTs,endTime:endTs,totalSeconds:secs,totalMiles:miles,
+      toll:toll||0,notes:notes||'',startOdo:startOdo||'',endOdo:endOdo||'',
+      manual:true,timeOnly:true,paid:false};
+    // If toll > 0, also create a standalone toll entry for the ledger
+    const newSessions=[...sessions,s];
+    setSessions(newSessions);LS.set('cfrc:sessions',newSessions);
+    if(toll>0){
+      const t={id:Date.now()+1,date,amount:toll,notes:'From manual session entry',paid:false};
+      const newTolls=[...tolls,t];setTolls(newTolls);LS.set('cfrc:tolls',newTolls);
+    }
+  },[sessions,tolls]);
+
+  const markSessionsPaid=useCallback((ids)=>{
+    const u=sessions.map(s=>ids.includes(s.id)?{...s,paid:true}:s);
+    setSessions(u);LS.set('cfrc:sessions',u);
+  },[sessions]);
+
+  const markTollsPaid=useCallback((ids)=>{
+    const u=tolls.map(t=>ids.includes(t.id)?{...t,paid:true}:t);
+    setTolls(u);LS.set('cfrc:tolls',u);
+  },[tolls]);
+
+  const addToll=useCallback((t)=>{
+    const u=[...tolls,t];setTolls(u);LS.set('cfrc:tolls',u);
+  },[tolls]);
+
+  const delToll=useCallback((id)=>{
+    const u=tolls.filter(t=>t.id!==id);setTolls(u);LS.set('cfrc:tolls',u);
+  },[tolls]);
+
+  const updateConfig=useCallback((cfg)=>{
+    setConfig(cfg);saveConfig(cfg);
+  },[]);
+
+  const saveCC=l=>{const u=[...coldChainLogs,{...l,id:uid()}];setCCLogs(u);LS.set('cfrc:cc',u);};
+  const updateCC=(id,updates)=>{const u=coldChainLogs.map(l=>l.id===id?{...l,...updates,form:{...(l.form||{}), ...updates}}:l);setCCLogs(u);LS.set('cfrc:cc',u);};
+  const delCC=id=>{const u=coldChainLogs.filter(l=>l.id!==id);setCCLogs(u);LS.set('cfrc:cc',u);};
+  const saveMf=m=>{const u=[...manifests,{...m,id:uid()}];setManifests(u);LS.set('cfrc:mfst',u);};
+  const delMf=id=>{const u=manifests.filter(m=>m.id!==id);setManifests(u);LS.set('cfrc:mfst',u);};
+  const saveRun=r=>{if(firebaseDB)firebaseDB.ref('cfrc/runs/'+r.id).set(r);else{const u=[...runs,r];setRuns(u);LS.set('cfrc:runs',u);}};
+  const delRun=id=>{if(firebaseDB)firebaseDB.ref('cfrc/runs/'+id).remove();else{const u=runs.filter(r=>r.id!==id);setRuns(u);LS.set('cfrc:runs',u);}};
+
+  const pendingCount=coldChainLogs.filter(l=>l.status==='pending').length;
+
+  const screens={
+    home:<HomeScreen sessions={sessions} coldChainLogs={coldChainLogs} manifests={manifests} isTracking={isTracking} elapsed={elapsed} totalMiles={totalMiles} go={setTab} runs={runs} fbMode={fbMode} config={config} onSettings={()=>setShowSettings(true)}/>,
+    tracker:<TrackerScreen isTracking={isTracking} elapsed={elapsed} totalMiles={totalMiles} gpsStatus={gpsStatus} sessionStart={sessionStart} onStart={startSession} onEnd={endSession} sessions={sessions} onDel={delSession} onMarkPaid={markSessionsPaid} onManualEntry={addManualSession} tolls={tolls} onAddToll={addToll} onDelToll={delToll} timeOnlyMode={timeOnlyMode} config={config} gapBridged={gapBridged} onBgGuide={openBgGuide}/>,
+    coldchain:<ColdChainScreen logs={coldChainLogs} onSave={saveCC} onUpdate={updateCC} onDel={delCC} runs={runs} config={config}/>,
+    manifest:<ManifestScreen manifests={manifests} onSave={saveMf} onDel={delMf} coldChainLogs={coldChainLogs} config={config}/>,
+    invoice:<InvoiceScreen sessions={sessions} coldChainLogs={coldChainLogs} manifests={manifests} config={config} tolls={tolls} onMarkSessionsPaid={markSessionsPaid} onMarkTollsPaid={markTollsPaid} onUpdateConfig={updateConfig} onAddToll={addToll}/>,
+  };
+
+  // Show setup screen on first launch (or after reset)
+  if(showSetup){
+    return <SetupScreen onComplete={cfg=>{
+      setConfig(cfg);
+      setShowSetup(false);
+      // Load data now that setup is done
+      setSessions(LS.get('cfrc:sessions')||[]);
+      setCCLogs(LS.get('cfrc:cc')||[]);
+      setManifests(LS.get('cfrc:mfst')||[]);
+      setTolls(LS.get('cfrc:tolls')||[]);
+      initFirebase();
+      if(firebaseDB){setFbMode(true);firebaseDB.ref('cfrc/runs').on('value',snap=>{const data=snap.val();setRuns(data?Object.values(data):[]);});}
+      else{setRuns(LS.get('cfrc:runs')||[]);}
+    }}/>;
+  }
+
+  // Loading state (config not yet read from localStorage)
+  if(!config){
+    return <div style={{minHeight:'100vh',background:'#1B2B5E',display:'flex',alignItems:'center',justifyContent:'center'}}>
+      <div style={{color:'white',fontSize:28,fontWeight:900,letterSpacing:'-0.02em'}}>RxRunner</div>
+    </div>;
+  }
+
+  return(
+    <div style={{fontFamily:'-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif',background:'#EEF2FF',minHeight:'100vh',maxWidth:480,margin:'0 auto',position:'relative'}}>
+      <div style={{paddingBottom:80,minHeight:'100vh'}}>{screens[tab]}</div>
+      <NavBar tab={tab} onTab={setTab} isTracking={isTracking} onMgr={()=>setShowMgr(true)} pendingCount={pendingCount}/>
+      {showMgr&&<DrugManagerPortal runs={runs} onSaveRun={saveRun} onDelRun={delRun} onClose={()=>setShowMgr(false)} fbMode={fbMode}/>}
+      {showSettings&&<SettingsModal config={config} onSave={cfg=>{setConfig(cfg);setShowSettings(false);}} onClose={()=>setShowSettings(false)} onReset={()=>{setShowSettings(false);setShowSetup(true);}}/>}
+      {showBgTutorial&&<BgTutorial onDismiss={()=>setShowBgTutorial(false)}/>}
+      {showBgModal&&<BgGuideModal onClose={()=>setShowBgModal(false)}/>}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════
+// RXRUNNER PWA BOOTSTRAP — fully self-contained, no extra files needed
+// Generates icon, manifest, and service worker all inline so the app
+// installs as a true PWA and survives Samsung/Android/iOS updates.
+// ═══════════════════════════════════════════════════════════════════
+(function () {
+
+  // ── 1. Draw RxRunner app icon ───────────────────────────────────────
+  function makeIcon(size) {
+    const c = document.createElement('canvas');
+    c.width = c.height = size;
+    const ctx = c.getContext('2d');
+    const s = size;
+
+    // Navy gradient background
+    const bg = ctx.createLinearGradient(0, 0, s, s);
+    bg.addColorStop(0, '#1B2B5E');
+    bg.addColorStop(1, '#0F1A3D');
+    ctx.fillStyle = bg;
+    ctx.beginPath();
+    ctx.roundRect(0, 0, s, s, s * 0.22);
+    ctx.fill();
+
+    // Subtle grid overlay
+    ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+    ctx.lineWidth = s * 0.005;
+    [0.25, 0.5, 0.75].forEach(t => {
+      ctx.beginPath(); ctx.moveTo(0, s*t); ctx.lineTo(s, s*t); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(s*t, 0); ctx.lineTo(s*t, s); ctx.stroke();
+    });
+
+    // Road / route line (vertical center)
+    ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+    ctx.lineWidth = s * 0.055;
+    ctx.setLineDash([s * 0.08, s * 0.06]);
+    ctx.beginPath();
+    ctx.moveTo(s * 0.5, s * 0.15);
+    ctx.lineTo(s * 0.5, s * 0.88);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Rx symbol — bold
+    ctx.font = `900 ${s * 0.42}px system-ui, sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    // Glow effect
+    ctx.shadowColor = '#4F8EF7';
+    ctx.shadowBlur = s * 0.08;
+    const rxGrad = ctx.createLinearGradient(0, s*0.25, 0, s*0.72);
+    rxGrad.addColorStop(0, '#7CB3FF');
+    rxGrad.addColorStop(1, '#4F8EF7');
+    ctx.fillStyle = rxGrad;
+    ctx.fillText('Rx', s * 0.5, s * 0.44);
+    ctx.shadowBlur = 0;
+
+    // "RUNNER" label below
+    ctx.font = `700 ${s * 0.115}px system-ui, sans-serif`;
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.letterSpacing = s * 0.012 + 'px';
+    ctx.fillText('RUNNER', s * 0.5, s * 0.735);
+
+    // Cold chain snowflake accent (top right corner)
+    ctx.font = `${s * 0.13}px serif`;
+    ctx.fillStyle = 'rgba(147,210,255,0.55)';
+    ctx.fillText('❄', s * 0.795, s * 0.195);
+
+    return c.toDataURL('image/png');
+  }
+
+  const icon192 = makeIcon(192);
+  const icon512 = makeIcon(512);
+
+  // ── 2. Build manifest blob and inject <link rel="manifest"> ────────
+  const manifest = {
+    name: 'RxRunner — Cold Chain Delivery',
+    short_name: 'RxRunner',
+    description: 'Cold chain medication delivery tracker for CFRC/CFHCS',
+    start_url: './',
+    display: 'standalone',
+    orientation: 'portrait',
+    background_color: '#1B2B5E',
+    theme_color: '#1B2B5E',
+    icons: [
+      { src: icon192, sizes: '192x192', type: 'image/png', purpose: 'any maskable' },
+      { src: icon512, sizes: '512x512', type: 'image/png', purpose: 'any maskable' }
+    ]
+  };
+  const mBlob = new Blob([JSON.stringify(manifest)], { type: 'application/manifest+json' });
+  const mURL  = window.__nativeCOBU(mBlob);
+  const mLink = document.createElement('link');
+  mLink.rel = 'manifest'; mLink.href = mURL;
+  document.head.appendChild(mLink);
+
+  // Apple touch icon (iOS home screen)
+  const aLink = document.createElement('link');
+  aLink.rel = 'apple-touch-icon'; aLink.href = icon192;
+  document.head.appendChild(aLink);
+
+  // ── 3. Register inline Service Worker ──────────────────────────────
+  if ('serviceWorker' in navigator) {
+    const swCode = `
+const CACHE = 'rxrunner-v1';
+const SHELL = ['./', './index.html'];
+
+self.addEventListener('install', e => {
+  e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).catch(() => {}));
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', e => {
+  e.waitUntil(
+    caches.keys().then(keys =>
+      Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))
+    )
+  );
+  self.clients.claim();
+});
+
+self.addEventListener('fetch', e => {
+  const url = e.request.url;
+  // Always network for Firebase, CDNs, Google APIs
+  if (url.includes('firebaseio.com') ||
+      url.includes('firebase.googleapis.com') ||
+      url.includes('googleapis.com') ||
+      url.includes('gstatic.com') ||
+      url.includes('unpkg.com') ||
+      url.includes('cdnjs.cloudflare.com')) return;
+
+  e.respondWith(
+    caches.match(e.request).then(cached => {
+      if (cached) return cached;
+      return fetch(e.request).then(res => {
+        if (res && res.status === 200 && res.type === 'basic') {
+          const clone = res.clone();
+          caches.open(CACHE).then(c => c.put(e.request, clone));
+        }
+        return res;
+      }).catch(() => cached);
+    })
+  );
+});
+`;
+    const swBlob = new Blob([swCode], { type: 'application/javascript' });
+    const swURL  = window.__nativeCOBU(swBlob);
+    navigator.serviceWorker.register(swURL, { scope: './' })
+      .then(() => console.log('RxRunner SW registered ✅'))
+      .catch(e => console.warn('SW skipped:', e.message));
+  }
+
+})();
+</script>
+
+</body>
+</html>
